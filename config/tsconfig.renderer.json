@@ -1,0 +1,20 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "../dist/renderer",
+    "rootDir": "../src",
+    "composite": true,
+    "tsBuildInfoFile": "../dist/renderer/tsconfig.tsbuildinfo",
+    "jsx": "react-jsx",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "types": ["vite/client", "electron", "react", "react-dom"]
+  },
+  "include": ["../src/renderer/**/*", "../src/renderer/**/*.json", "../src/shared/**/*", "../src/preload/**/*"],
+  "references": [{ "path": "./tsconfig.shared.json" }]
+}

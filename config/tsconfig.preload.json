@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "../dist/preload",
+    "rootDir": "../src/preload",
+    "composite": true,
+    "tsBuildInfoFile": "../dist/preload/tsconfig.tsbuildinfo",
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "noEmit": false
+  },
+  "include": ["../src/preload/**/*", "../src/shared/**/*"],
+  "references": [{ "path": "./tsconfig.shared.json" }]
+}

@@ -1,0 +1,166 @@
+{
+  "name": "exco",
+  "version": "0.1.0",
+  "description": "EXCO — Autonomous Engineering Intelligence Platform",
+  "author": "EXCO Team",
+  "license": "MIT",
+  "main": "dist/main/main.js",
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:vite\" \"npm:dev:electron\"",
+    "dev:vite": "vite --config config/vite.config.ts --mode development",
+    "dev:electron": "wait-on tcp:5173 && cross-env NODE_ENV=development electron dist/main/main.js",
+    "build": "npm run build:shared && npm run build:main && npm run build:renderer && npm run build:preload",
+    "build:shared": "tsc -p config/tsconfig.shared.json",
+    "build:main": "tsc -p config/tsconfig.main.json",
+    "build:renderer": "vite build --config config/vite.config.ts --mode production",
+    "build:preload": "tsc -p config/tsconfig.preload.json",
+    "pack": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder --win"
+  },
+  "dependencies": {
+    "@types/module-alias": "^2.0.4",
+    "@types/sql.js": "^1.16.0",
+    "better-sqlite3": "^9.6.0",
+    "clsx": "^2.1.0",
+    "date-fns": "^3.6.0",
+    "diff": "^5.2.0",
+    "electron-store": "^10.0.0",
+    "electron-updater": "^6.2.0",
+    "highlight.js": "^11.9.0",
+    "immer": "^10.1.0",
+    "keytar": "^7.9.0",
+    "lucide-react": "^0.460.0",
+    "marked": "^12.0.0",
+    "module-alias": "^2.3.5",
+    "node-pty": "^1.0.0",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "react-router-dom": "^6.23.0",
+    "sql.js": "^1.17.0",
+    "tailwind-merge": "^2.3.0",
+    "uuid": "^9.0.0",
+    "xterm": "^5.3.0",
+    "zod": "^3.23.0",
+    "zustand": "^4.5.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/uuid": "^10.0.0",
+    "@vitejs/plugin-react": "^4.7.0",
+    "autoprefixer": "^10.7.0",
+    "concurrently": "^8.2.0",
+    "cross-env": "^7.0.0",
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.0",
+    "eslint": "^8.57.0",
+    "postcss": "^8.4.38",
+    "prettier": "^3.2.0",
+    "rcedit": "^5.0.2",
+    "rimraf": "^5.0.0",
+    "tailwindcss": "^3.4.0",
+    "ts-node": "^10.9.0",
+    "tsc-alias": "^1.9.10",
+    "typescript": "^5.4.0",
+    "vite": "^5.2.0",
+    "vitest": "^1.5.0",
+    "wait-on": "^7.2.0"
+  },
+  "build": {
+    "appId": "com.exco.app",
+    "productName": "EXCO",
+    "copyright": "Copyright © 2026 EXCO Team",
+    "directories": {
+      "output": "dist/electron",
+      "buildResources": "build-resources"
+    },
+    "afterPack": "config/afterPack.cjs",
+    "files": [
+      "dist/main/**/*",
+      "dist/renderer/**/*",
+      "dist/preload/**/*",
+      "dist/shared/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build-resources/icon.ico",
+        "to": "icon.ico"
+      },
+      {
+        "from": "build-resources/icon.png",
+        "to": "icon.png"
+      },
+      {
+        "from": "skills",
+        "to": "skills"
+      }
+    ],
+    "asarUnpack": [
+      "**/*.wasm"
+    ],
+    "win": {
+      "icon": "build-resources/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "signAndEditExecutable": false,
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "category": "public.app-category.developer-tools"
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "deb",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "category": "Development"
+    },
+    "nsis": {
+      "artifactName": "EXCO-${version}-Setup.${ext}",
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "EXCO",
+      "installerIcon": "build-resources/icon.ico",
+      "uninstallerIcon": "build-resources/icon.ico",
+      "installerHeaderIcon": "build-resources/icon.ico"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "Bishnucd",
+      "repo": "EXCO",
+      "releaseType": "release"
+    }
+  }
+}

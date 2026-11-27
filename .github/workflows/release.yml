@@ -1,0 +1,56 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Compile Application
+        run: npm run build
+
+      - name: Package Windows Installer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --win --publish always
+
+      - name: Publish Release with Version Notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        shell: pwsh
+        run: |
+          $notes = if (Test-Path "CHANGELOG.md") {
+            Get-Content -Raw "CHANGELOG.md"
+          } else {
+            "Release $env:TAG_NAME"
+          }
+          $notesFile = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          $sectionMatch = [regex]::Match($notes, "(?ms)^##\s+$([regex]::Escape($env:TAG_NAME))\s*\r?\n(.*?)(?=^##\s+|\z)")
+          if ($sectionMatch.Success) {
+            Set-Content -Path $notesFile -Value $sectionMatch.Groups[1].Value.Trim() -Encoding UTF8
+          } else {
+            Set-Content -Path $notesFile -Value $notes -Encoding UTF8
+          }
+          gh release edit $env:TAG_NAME --draft=false --title "EXCO $env:TAG_NAME" --notes-file $notesFile
