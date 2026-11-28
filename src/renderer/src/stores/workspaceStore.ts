@@ -225,10 +225,11 @@ interface WorkspaceState {
   selectFile: (file: FileSystemNode | null) => void;
   getEffectiveFolders: () => EffectiveProjectFolder[];
 
-  // In-explorer manipulation (no PC deletion!)
+  // In-explorer manipulation (create, rename, and move to OS Recycle Bin)
   createFileInDir: (dirPath: string, fileName: string) => Promise<FileSystemNode | null>;
   createFolderInDir: (parentDirPath: string, folderName: string) => Promise<void>;
   renameFsEntry: (oldPath: string, newName: string) => Promise<void>;
+  deleteFsEntry: (targetPath: string) => Promise<void>;
 
   createTerminal: (cwd?: string) => Promise<TerminalSession>;
   closeTerminal: (terminalId: string) => Promise<void>;
@@ -286,12 +287,29 @@ export const useWorkspaceStore = create<WorkspaceState>()(
           activeProjectId = projects[0].id;
         }
 
+        // Prune any phantom folders that no longer exist on disk before rendering
+        const initialAllPaths = getAllProjectFolderPaths(projects);
+        if (initialAllPaths.length > 0) {
+          await window.exco.workspace.setAllowedPaths(initialAllPaths).catch(() => {});
+          const existsEntries = await Promise.all(
+            initialAllPaths.map(async p => {
+              const res = await window.exco.fs.exists(p).catch(() => ({ exists: false, isDirectory: false }));
+              return [normPath(p), Boolean(res?.exists && res?.isDirectory)] as const;
+            })
+          );
+          const existsMap = new Map(existsEntries);
+          projects = projects.map(p => ({
+            ...p,
+            folders: (p.folders || []).filter(f => f?.path && existsMap.get(normPath(f.path))),
+          }));
+        }
+
         const activeProj = projects.find(p => p.id === activeProjectId) || null;
         const primaryFolder = activeProj?.folders?.[0] || null;
         const expandedProjects = new Set<string>(get().expandedProjects);
         if (activeProjectId) expandedProjects.add(activeProjectId);
 
-        const expandedPaths = new Set<string>(get().expandedPaths);
+        const expandedPaths = new Set<string>();
         for (const p of projects) {
           for (const f of p.folders || []) {
             expandedPaths.add(f.path);
@@ -660,22 +678,49 @@ export const useWorkspaceStore = create<WorkspaceState>()(
           ? folderList.filter(p => normPath(p) === normPath(dirPath))
           : folderList;
 
-        const nextTrees: Record<string, FileSystemNode[]> = dirPath ? { ...get().fileTrees } : { ...get().fileTrees };
+        const nextTrees: Record<string, FileSystemNode[]> = { ...get().fileTrees };
+        const missingPaths = new Set<string>();
         let firstError: string | null = null;
 
         await Promise.all(
           (targets.length > 0 ? targets : folderList).map(async folderPath => {
             try {
+              const status = await window.exco.fs.exists(folderPath).catch(() => ({ exists: true, isDirectory: true }));
+              if (!status?.exists || !status?.isDirectory) {
+                missingPaths.add(normPath(folderPath));
+                delete nextTrees[folderPath];
+                return;
+              }
               const tree = await buildHierarchicalTree(folderPath, expandedPaths);
               nextTrees[folderPath] = tree;
             } catch (err) {
-              firstError = err instanceof Error ? err.message : 'Failed to load directory';
+              const msg = err instanceof Error ? err.message : 'Failed to load directory';
+              if (/enoent|no such file|not found/i.test(msg)) {
+                missingPaths.add(normPath(folderPath));
+                delete nextTrees[folderPath];
+              } else {
+                firstError = msg;
+              }
             }
           })
         );
 
-        const primaryPath = get().workspace?.path;
+        let updatedProjects = projects;
+        if (missingPaths.size > 0) {
+          updatedProjects = projects.map(p => ({
+            ...p,
+            folders: (p.folders || []).filter(f => !missingPaths.has(normPath(f.path))),
+          }));
+          const prunedPaths = getAllProjectFolderPaths(updatedProjects);
+          await persistProjectsToDatabase(updatedProjects);
+          await syncWatchers(prunedPaths, () => get().loadFileTree());
+        }
+
+        const activeProj = updatedProjects.find(p => p.id === get().activeProjectId) || null;
+        const primaryFolder = activeProj?.folders?.[0] || null;
+        const primaryPath = primaryFolder?.path;
         set({
+          ...(missingPaths.size > 0 ? { projects: updatedProjects, workspace: primaryFolder } : {}),
           fileTrees: nextTrees,
           fileTree: primaryPath ? nextTrees[primaryPath] || [] : [],
           error: firstError,
@@ -798,6 +843,62 @@ export const useWorkspaceStore = create<WorkspaceState>()(
               name: clean,
               extension: clean.includes('.') ? clean.split('.').pop() : undefined,
             },
+          });
+        }
+
+        await get().loadFileTree();
+      },
+
+      deleteFsEntry: async (targetPath: string) => {
+        if (!targetPath) return;
+        const targetNorm = normPath(targetPath);
+
+        // Move file or folder to OS Recycle Bin (removes from disk folder cleanly)
+        await window.exco.fs.delete(targetPath);
+
+        const nextExpanded = new Set<string>();
+        for (const p of get().expandedPaths) {
+          const pNorm = normPath(p);
+          if (pNorm !== targetNorm && !pNorm.startsWith(targetNorm + '/')) {
+            nextExpanded.add(p);
+          }
+        }
+
+        const currentSelected = get().selectedFile;
+        const selectedNorm = currentSelected ? normPath(currentSelected.path) : '';
+        const shouldClearSelected =
+          Boolean(selectedNorm) && (selectedNorm === targetNorm || selectedNorm.startsWith(targetNorm + '/'));
+
+        // Also remove from any project root folder list if a top-level folder itself was deleted
+        const hadRootMatch = get().projects.some(p =>
+          (p.folders || []).some(f => normPath(f.path) === targetNorm)
+        );
+        let nextProjects = get().projects;
+        const nextTrees = { ...get().fileTrees };
+        delete nextTrees[targetPath];
+
+        if (hadRootMatch) {
+          nextProjects = nextProjects.map(p => ({
+            ...p,
+            folders: (p.folders || []).filter(f => normPath(f.path) !== targetNorm),
+            updatedAt: Date.now(),
+          }));
+          const activeProj = nextProjects.find(p => p.id === get().activeProjectId) || null;
+          const primaryFolder = activeProj?.folders?.[0] || null;
+          set({
+            projects: nextProjects,
+            workspace: primaryFolder,
+            fileTrees: nextTrees,
+            fileTree: primaryFolder ? nextTrees[primaryFolder.path] || [] : [],
+            expandedPaths: nextExpanded,
+            ...(shouldClearSelected ? { selectedFile: null } : {}),
+          });
+          await persistProjectsToDatabase(nextProjects);
+          await syncWatchers(getAllProjectFolderPaths(nextProjects), () => get().loadFileTree());
+        } else {
+          set({
+            expandedPaths: nextExpanded,
+            ...(shouldClearSelected ? { selectedFile: null } : {}),
           });
         }
 

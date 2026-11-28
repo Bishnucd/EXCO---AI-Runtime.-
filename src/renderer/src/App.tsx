@@ -99,7 +99,7 @@ function App() {
     availableVersion?: string;
     progress?: number;
     error?: string;
-  }>({ status: 'idle', currentVersion: '0.1.0' });
+  }>({ status: 'idle', currentVersion: '0.1.2' });
 
   // Subscribe to background update status
   useEffect(() => {

@@ -50,6 +50,7 @@ describe('EXCO Main Process: SQL Injection, Workflow, Failover, Extraction & San
   let providersMod: typeof import('../main/services/ai-providers');
   let agentMod: typeof import('../main/services/workspace-agent');
   let vaultMod: typeof import('../main/services/credential-vault');
+  let organizerMod: typeof import('../main/services/workspace-organizer');
 
   let mockServer: http.Server;
   let mockBaseUrl = '';
@@ -63,6 +64,7 @@ describe('EXCO Main Process: SQL Injection, Workflow, Failover, Extraction & San
     providersMod = require(path.join(distMainDir, 'services/ai-providers/index.js'));
     agentMod = require(path.join(distMainDir, 'services/workspace-agent.js'));
     vaultMod = require(path.join(distMainDir, 'services/credential-vault.js'));
+    organizerMod = require(path.join(distMainDir, 'services/workspace-organizer.js'));
 
     // Mock HTTP server for custom endpoint extraction, x-api-key, 401 auth handling, and ReAct tool loop
     let turnCounter = 0;
@@ -261,6 +263,86 @@ describe('EXCO Main Process: SQL Injection, Workflow, Failover, Extraction & San
       expect(routerMod.isModelExhausted('bad-key-1', 'any-model')).toBe(true);
       expect(routerMod.isModelExhausted('healthy-key-2', 'any-model')).toBe(false);
     });
+
+    it('enforces manual category selection without auto-switching and fails over to same model across API keys first', async () => {
+      routerMod.clearRouterStateForTests();
+      const mkCand = (keyId: string, modelId: string, modelName: string, category: 'turbo' | 'standard' | 'deep-thought', turboScore: number, overallScore: number) => ({
+        keyId,
+        keyName: `Key ${keyId}`,
+        keySecret: `secret-${keyId}`,
+        providerId: 'google',
+        providerDisplayName: `Key ${keyId}`,
+        modelId,
+        modelName,
+        category,
+        tier: 'free' as const,
+        overallScore,
+        turboScore,
+        standardScore: overallScore,
+        deepThoughtScore: category === 'deep-thought' ? 95 : 75,
+        speedScore: category === 'turbo' ? 240 : 190,
+        researchScore: category === 'deep-thought' ? 250 : 180,
+        documentationScore: 200,
+        codingScore: 200,
+        contextWindow: 1000000,
+      });
+
+      const pool = [
+        mkCand('k1', 'gemini-2.5-flash', 'Gemini 2.5 Flash', 'turbo', 96, 89),
+        mkCand('k2', 'gemini-2.5-flash', 'Gemini 2.5 Flash', 'turbo', 96, 89),
+        mkCand('k1', 'gpt-4o-mini', 'GPT-4o Mini', 'turbo', 91, 80),
+        mkCand('k1', 'gemini-2.5-pro', 'Gemini 2.5 Pro', 'deep-thought', 74, 90),
+      ];
+
+      // Even with research/architecture keywords, Turbo must NOT auto-switch to Deep Thought
+      const d1 = await routerMod.routeTurnWithOverviewer({
+        pool,
+        promptText: 'Perform deep research and system architecture analysis',
+        workflowMode: 'turbo',
+        preferredKeyId: 'k1',
+      });
+      expect(d1?.category).toBe('turbo');
+      expect(d1?.selected.modelId).toBe('gemini-2.5-flash');
+      expect(d1?.selected.keyId).toBe('k1');
+      // Same model on k2 must come before 2nd-best model (gpt-4o-mini) on k1
+      expect(d1?.candidates.slice(0, 3).map(c => `${c.keyId}:${c.modelId}`)).toEqual([
+        'k1:gemini-2.5-flash',
+        'k2:gemini-2.5-flash',
+        'k1:gpt-4o-mini',
+      ]);
+
+      // Exhaust k1's gemini-2.5-flash -> next route must pick k2's gemini-2.5-flash (same model, other key)
+      routerMod.markModelExhausted('k1', 'gemini-2.5-flash', '429 quota');
+      const d2 = await routerMod.routeTurnWithOverviewer({
+        pool: pool.filter(c => !routerMod.isModelExhausted(c.keyId, c.modelId)),
+        promptText: 'Hello',
+        workflowMode: 'turbo',
+        preferredKeyId: 'k1',
+      });
+      expect(d2?.selected.modelId).toBe('gemini-2.5-flash');
+      expect(d2?.selected.keyId).toBe('k2');
+
+      // Exhaust k2's gemini-2.5-flash -> moves to 2nd-best model (gpt-4o-mini)
+      routerMod.markModelExhausted('k2', 'gemini-2.5-flash', '429 quota');
+      const d3 = await routerMod.routeTurnWithOverviewer({
+        pool: pool.filter(c => !routerMod.isModelExhausted(c.keyId, c.modelId)),
+        promptText: 'Hello',
+        workflowMode: 'turbo',
+        preferredKeyId: 'k1',
+      });
+      expect(d3?.selected.modelId).toBe('gpt-4o-mini');
+
+      // When cooldown resets / cleared, best model is automatically reclaimed again
+      routerMod.clearRouterStateForTests();
+      const d4 = await routerMod.routeTurnWithOverviewer({
+        pool,
+        promptText: 'Hello again',
+        workflowMode: 'turbo',
+        preferredKeyId: 'k1',
+      });
+      expect(d4?.selected.modelId).toBe('gemini-2.5-flash');
+      expect(d4?.selected.keyId).toBe('k1');
+    });
   });
 
   describe('Universal Custom Endpoint Extraction & Auth Handling', () => {
@@ -403,6 +485,50 @@ describe('EXCO Main Process: SQL Injection, Workflow, Failover, Extraction & San
       dbMod.deleteApiKey(savedKey.id);
       dbMod.deleteProvider(savedProv.id);
       fs.rmSync(wsParent, { recursive: true, force: true });
+    });
+
+    it('enforces clean folder organization and clean formatting for new configs, docs, data, and downloads', () => {
+      const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'exco-clean-org-'));
+      try {
+        // Pre-existing root file stays untouched
+        fs.writeFileSync(path.join(wsDir, 'package.json'), '{"name":"demo"}\n', 'utf8');
+        const pkgRes = organizerMod.resolveCleanWorkspaceWritePath(path.join(wsDir, 'package.json'), wsDir);
+        expect(pkgRes.redirectedFolder).toBeNull();
+        expect(pkgRes.resolvedPath).toBe(path.join(wsDir, 'package.json'));
+
+        // Loose root configs, notes, csv/sql datasets, and assets route cleanly into structured folders
+        const eslintRes = organizerMod.resolveCleanWorkspaceWritePath(path.join(wsDir, 'eslint.config.js'), wsDir);
+        expect(eslintRes.redirectedFolder).toBe('config');
+        expect(eslintRes.relativeToRoot).toBe('config/eslint.config.js');
+
+        const tsconfigAppRes = organizerMod.resolveCleanWorkspaceWritePath(path.join(wsDir, 'tsconfig.app.json'), wsDir);
+        expect(tsconfigAppRes.redirectedFolder).toBe('config');
+        expect(tsconfigAppRes.relativeToRoot).toBe('config/tsconfig.app.json');
+
+        const docRes = organizerMod.resolveCleanWorkspaceWritePath(path.join(wsDir, 'architecture.md'), wsDir);
+        expect(docRes.redirectedFolder).toBe('docs');
+
+        const dataRes = organizerMod.resolveCleanWorkspaceWritePath(path.join(wsDir, 'users.csv'), wsDir);
+        expect(dataRes.redirectedFolder).toBe('data');
+
+        const assetRes = organizerMod.resolveCleanWorkspaceWritePath(path.join(wsDir, 'report.pdf'), wsDir);
+        expect(assetRes.redirectedFolder).toBe('assets');
+
+        // Clean formatting pretty-prints JSON and normalizes CRLF + excessive blank lines in code/text
+        const formattedJson = organizerMod.formatWorkspaceFileContent('config/tsconfig.app.json', '{"compilerOptions":{"strict":true}}');
+        expect(formattedJson).toBe('{\n  "compilerOptions": {\n    "strict": true\n  }\n}\n');
+
+        const formattedTs = organizerMod.formatWorkspaceFileContent('src/app.ts', 'const a = 1;  \r\n\r\n\r\n\r\nexport default a;\r\n');
+        expect(formattedTs).toBe('const a = 1;\n\nexport default a;\n');
+
+        // Fallback lookup resolves a previously organized config when referenced by root path
+        fs.mkdirSync(path.join(wsDir, 'config'), { recursive: true });
+        fs.writeFileSync(path.join(wsDir, 'config', 'eslint.config.js'), 'export default [];\n', 'utf8');
+        const resolvedFallback = organizerMod.findOrganizedFallbackPath(path.join(wsDir, 'eslint.config.js'), [wsDir], wsDir);
+        expect(resolvedFallback).toBe(path.join(wsDir, 'config', 'eslint.config.js'));
+      } finally {
+        fs.rmSync(wsDir, { recursive: true, force: true });
+      }
     });
   });
 

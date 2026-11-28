@@ -18,7 +18,6 @@ import {
   Zap,
   Brain,
   Sparkles,
-  Wand2,
   Shield,
   ShieldAlert,
   ShieldCheck,
@@ -43,6 +42,8 @@ import {
   formatFileSize,
   getProviderDisplayName,
   classifyModelCategory,
+  computeModelBenchmarks,
+  scoreModelForWorkflowCategory,
   type ModelCategory,
 } from '@shared/utils';
 import type { PermissionLevel } from '@shared/types';
@@ -55,7 +56,6 @@ import { InfoTip } from '../components/InfoTip';
 import { useDismissOutside } from '../hooks/useDismissOutside';
 import {
   WORKFLOW_CATEGORIES,
-  AUTO_WORKFLOW_INFO,
   formatCompactTokens,
   encodeSamplesToWavBase64,
   type WorkflowSelection,
@@ -199,7 +199,7 @@ const WorkMode: React.FC = () => {
   const [showKeySelector, setShowKeySelector] = useState(false);
   const [selectedModel, setSelectedModel] = useState<string>(() => {
     const saved = localStorage.getItem('exco:work:preferred-model');
-    return saved && saved !== 'default' ? saved : 'auto';
+    return saved && saved !== 'default' && saved !== 'auto' ? saved : 'category-best';
   });
   const [preferredFailover, setPreferredFailover] = useState<boolean>(() => localStorage.getItem('exco:work:preferred-failover') !== 'false');
   const [availableModels, setAvailableModels] = useState<any[]>([]);
@@ -207,12 +207,14 @@ const WorkMode: React.FC = () => {
   const [usageSummary, setUsageSummary] = useState<{ tokensUsed: number; tokenCap: number | null; requests: number; source: string } | null>(null);
   const [showModelSelector, setShowModelSelector] = useState(false);
   const [modelSearchQuery, setModelSearchQuery] = useState('');
-  const [workflowMode, setWorkflowMode] = useState<WorkflowSelection>(() => {
-    const saved = localStorage.getItem('exco:work:workflow-mode');
-    return saved === 'auto' || saved === 'turbo' || saved === 'standard' || saved === 'deep-thought' ? saved : 'auto';
+  const [workflowMode, setWorkflowMode] = useState<WorkflowSelection | null>(() => {
+    localStorage.removeItem('exco:work:workflow-mode');
+    const saved = sessionStorage.getItem('exco:work:workflow-mode');
+    if (saved === 'turbo' || saved === 'standard' || saved === 'deep-thought') return saved;
+    return null;
   });
   const [modelCategoryTab, setModelCategoryTab] = useState<ModelCategory>(() => {
-    const savedWf = localStorage.getItem('exco:work:workflow-mode');
+    const savedWf = sessionStorage.getItem('exco:work:workflow-mode');
     return savedWf === 'standard' || savedWf === 'deep-thought' ? savedWf : 'turbo';
   });
   const [showModeSelector, setShowModeSelector] = useState(false);
@@ -452,6 +454,10 @@ const WorkMode: React.FC = () => {
           (list.some((k: any) => k.id === selectedKeyId) && selectedKeyId) ||
           list[0].id;
         setSelectedKeyId(nextKeyId);
+        if (preferredKeyId) {
+          setSelectedModel('category-best');
+          localStorage.setItem('exco:work:preferred-model', 'category-best');
+        }
         await loadModelsAndUsage(nextKeyId);
       } else {
         setSelectedKeyId('');
@@ -503,7 +509,7 @@ const WorkMode: React.FC = () => {
       if (detail?.modelId) setSelectedModel(detail.modelId);
       if (detail?.workflowMode) {
         setWorkflowMode(detail.workflowMode);
-        setModelCategoryTab(detail.workflowMode === 'auto' ? 'turbo' : detail.workflowMode);
+        setModelCategoryTab(detail.workflowMode);
       }
     };
     window.addEventListener('exco:keys-updated', handleKeysUpdate as EventListener);
@@ -761,6 +767,11 @@ const WorkMode: React.FC = () => {
       return;
     }
 
+    if (!workflowMode) {
+      setShowModeSelector(true);
+      return;
+    }
+
     const selectedModelObj = availableModels.find((m: any) => m.id === selectedModel);
     const activeKeyObj =
       (selectedModelObj?.keyId ? apiKeys.find((k: any) => k.id === selectedModelObj.keyId) : undefined) ||
@@ -811,7 +822,7 @@ const WorkMode: React.FC = () => {
         prompt: trimmedPrompt || 'Analyze attached files in this workspace.',
         attachments: attachmentsPayload,
         keyId: activeKeyObj?.id,
-        modelId: selectedModel && selectedModel !== 'auto' ? selectedModel : undefined,
+        modelId: selectedModel && selectedModel !== 'auto' && selectedModel !== 'category-best' ? selectedModel : undefined,
         providerId: activeKeyObj?.providerId,
         preferredFailover,
         workflowMode,
@@ -1068,12 +1079,36 @@ const WorkMode: React.FC = () => {
     );
   };
 
+  const getCategoryRankedModels = useCallback(
+    (category: ModelCategory) => {
+      return availableModels
+        .filter((m: any) => m && m.id && m.id !== 'auto')
+        .map((m: any) => {
+          const bench = computeModelBenchmarks(m);
+          const resolvedCategory = m.category || bench.category || classifyModelCategory(m);
+          const catScore =
+            m.categoryScores?.[category] ??
+            scoreModelForWorkflowCategory(bench.scores, bench.overallScore, category);
+          const overallScore = m.overallScore ?? bench.overallScore;
+          return {
+            ...m,
+            category: resolvedCategory,
+            overallScore,
+            catScore,
+          };
+        })
+        .filter((m: any) => m.category === category)
+        .sort((a: any, b: any) => (b.catScore - a.catScore) || (b.overallScore - a.overallScore));
+    },
+    [availableModels]
+  );
+
   const activeTier = ACCESS_LIMITER_TIERS.find(t => t.id === accessLevel) || ACCESS_LIMITER_TIERS[1];
   const TierIcon = activeTier.icon;
-  const activeWorkflowLabel =
-    workflowMode === 'auto'
-      ? 'Auto'
-      : WORKFLOW_CATEGORIES.find(w => w.id === workflowMode)?.label || 'Standard';
+  const activeWorkflowLabel = workflowMode
+    ? WORKFLOW_CATEGORIES.find(w => w.id === workflowMode)?.label || 'Standard'
+    : 'Select Mode';
+  const activeCategoryTopModel = workflowMode ? getCategoryRankedModels(workflowMode)[0] : undefined;
 
   const hasActiveWallpaper =
     Boolean(globalFilter.bgImageMode === 'auto' ? globalFilter.autoWallpaperUrl : globalFilter.bgImage) &&
@@ -1164,6 +1199,46 @@ const WorkMode: React.FC = () => {
                   <FolderOpen className="w-4 h-4" />
                   <span>Select Folder</span>
                 </button>
+              ) : apiKeys.length > 0 && !workflowMode ? (
+                <div className="w-full max-w-2xl rounded-2xl border border-[rgb(var(--color-border))] bg-[rgb(var(--color-surface))] p-4 text-left shadow-lg">
+                  <p className="text-xs font-bold uppercase tracking-wider text-sky-600 dark:text-sky-400">
+                    Step 1 · Choose Your Workflow Mode
+                  </p>
+                  <p className="text-xs text-[rgb(var(--color-foreground))]/85 mt-1 leading-relaxed">
+                    Select <strong>Turbo</strong>, <strong>Standard</strong>, or <strong>Deep Thought</strong> to get started. Work Agent automatically runs the top-ranked Overview model in your chosen mode and fails over across API keys if quota runs out.
+                  </p>
+                  <div className="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                    {WORKFLOW_CATEGORIES.map(wf => {
+                      const Icon = wf.id === 'turbo' ? Zap : wf.id === 'deep-thought' ? Brain : Sparkles;
+                      const topModel = getCategoryRankedModels(wf.id)[0];
+                      return (
+                        <button
+                          key={wf.id}
+                          type="button"
+                          onClick={() => {
+                            setWorkflowMode(wf.id);
+                            setModelCategoryTab(wf.id);
+                            setSelectedModel('category-best');
+                            sessionStorage.setItem('exco:work:workflow-mode', wf.id);
+                            localStorage.setItem('exco:work:preferred-model', 'category-best');
+                          }}
+                          className="p-3 rounded-xl border border-[rgb(var(--color-border))] bg-[rgb(var(--color-background))]/70 hover:bg-[rgb(var(--color-surface-hover))] text-left whitespace-normal transition-all flex flex-col gap-1.5"
+                        >
+                          <div className="flex items-center gap-2">
+                            <Icon className={cn('w-4 h-4 flex-shrink-0', wf.id === 'turbo' ? 'text-amber-400' : wf.id === 'deep-thought' ? 'text-purple-400' : 'text-sky-400')} />
+                            <span className="text-xs font-bold text-[rgb(var(--color-foreground))]">{wf.label}</span>
+                          </div>
+                          <p className="text-[11px] text-[rgb(var(--color-foreground-muted))] leading-snug">{wf.shortDesc}</p>
+                          {topModel && (
+                            <p className="text-[10px] font-mono text-emerald-400 truncate mt-auto pt-1">
+                              Top: {topModel.name || topModel.id} ({topModel.catScore}/100)
+                            </p>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
               ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 w-full max-w-xl">
                   {WORK_STARTER_PROMPTS.map(item => (
@@ -1396,6 +1471,29 @@ const WorkMode: React.FC = () => {
               className="relative rounded-3xl border border-[rgb(var(--color-border))] ui-translucent shadow-xl px-4 py-3 transition-all focus-within:border-[rgb(var(--color-primary))]"
               style={getSegmentStyle(composer)}
             >
+              {apiKeys.length > 0 && !workflowMode && messages.length > 0 && (
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-xl border border-amber-500/40 bg-amber-500/10 text-xs">
+                  <span className="font-medium text-amber-700 dark:text-amber-300">Select a workflow mode to send tasks:</span>
+                  <div className="flex items-center gap-1.5">
+                    {WORKFLOW_CATEGORIES.map(wf => (
+                      <button
+                        key={wf.id}
+                        type="button"
+                        onClick={() => {
+                          setWorkflowMode(wf.id);
+                          setModelCategoryTab(wf.id);
+                          setSelectedModel('category-best');
+                          sessionStorage.setItem('exco:work:workflow-mode', wf.id);
+                          localStorage.setItem('exco:work:preferred-model', 'category-best');
+                        }}
+                        className="px-2.5 py-1 rounded-lg border border-[rgb(var(--color-border))] bg-[rgb(var(--color-surface))] hover:bg-[rgb(var(--color-surface-hover))] text-[11px] font-semibold"
+                      >
+                        {wf.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
               {/* Attached Files Preview */}
               {attachedFiles.length > 0 && (
                 <div className="flex flex-wrap gap-2 mb-2.5">
@@ -1519,29 +1617,44 @@ const WorkMode: React.FC = () => {
                         className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[rgb(var(--color-foreground-muted))] hover:text-[rgb(var(--color-foreground))] hover:bg-[rgb(var(--color-surface-hover))] text-xs font-medium transition-colors whitespace-nowrap"
                       >
                         <Cpu className="w-3.5 h-3.5 text-sky-400" />
-                        <span className="truncate max-w-[140px]">
-                          {selectedModel === 'auto'
-                            ? 'Auto Model'
+                        <span className="truncate max-w-[160px]">
+                          {selectedModel === 'category-best'
+                            ? workflowMode
+                              ? activeCategoryTopModel
+                                ? `Best (${activeWorkflowLabel}): ${activeCategoryTopModel.name || activeCategoryTopModel.id}`
+                                : `Best in ${activeWorkflowLabel}`
+                              : 'Agent Models'
                             : availableModels.find((m: any) => m.id === selectedModel)?.name || selectedModel}
                         </span>
                         <ChevronDown className="w-3 h-3 opacity-60" />
                       </button>
 
-                      {showModelSelector && (
+                      {showModelSelector && (() => {
+                        const activeCategoryMeta =
+                          WORKFLOW_CATEGORIES.find(w => w.id === modelCategoryTab) || WORKFLOW_CATEGORIES[0];
+                        const categoryModels = getCategoryRankedModels(modelCategoryTab).filter(
+                          (m: any) =>
+                            !modelSearchQuery ||
+                            `${m.id} ${m.name} ${m.keyName || ''} ${m.providerDisplayName || ''}`
+                              .toLowerCase()
+                              .includes(modelSearchQuery.toLowerCase())
+                        );
+                        const topInTab = categoryModels[0];
+                        return (
                         <div
-                          className="absolute left-0 bottom-full mb-2 w-80 bg-[rgb(var(--color-surface))] border border-[rgb(var(--color-border))] rounded-xl shadow-2xl py-2 z-50 animate-scale-in overflow-hidden"
+                          className="absolute left-0 bottom-full mb-2 w-[26rem] max-w-[92vw] bg-[rgb(var(--color-surface))] border border-[rgb(var(--color-border))] rounded-xl shadow-2xl py-2 z-50 animate-scale-in overflow-hidden"
                           style={getSegmentStyle(modelSelector)}
                           onClick={e => e.stopPropagation()}
                         >
                           <div className="px-3 pb-2 border-b border-[rgb(var(--color-border))] flex items-center justify-between gap-2">
                             <div className="flex items-center gap-1.5">
                               <span className="text-[11px] font-semibold uppercase tracking-wider text-[rgb(var(--color-foreground-muted))]">
-                                Agent Models ({availableModels.length})
+                                Agent Models ({categoryModels.length})
                               </span>
                               <InfoTip
                                 align="left"
-                                title="Model Selection"
-                                text="Auto picks the best model for your selected workflow, or select a specific model below."
+                                title={activeCategoryMeta.label}
+                                text={activeCategoryMeta.detail}
                               />
                             </div>
                             <button
@@ -1554,7 +1667,7 @@ const WorkMode: React.FC = () => {
                             </button>
                           </div>
 
-                          <div className="px-2.5 py-1.5 border-b border-[rgb(var(--color-border))] space-y-1.5">
+                          <div className="px-3 py-2 border-b border-[rgb(var(--color-border))] space-y-1.5">
                             <input
                               type="text"
                               value={modelSearchQuery}
@@ -1562,7 +1675,7 @@ const WorkMode: React.FC = () => {
                               placeholder="Filter models in category..."
                               className="w-full px-2.5 py-1 text-xs rounded-md bg-[rgb(var(--color-background))]"
                             />
-                            <div className="grid grid-cols-3 gap-1">
+                            <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.15fr)_minmax(0,1.45fr)] gap-1.5">
                               {WORKFLOW_CATEGORIES.map(wf => {
                                 const wfCount = availableModels.filter((m: any) => m.id !== 'auto' && (m.category || classifyModelCategory(m)) === wf.id).length;
                                 return (
@@ -1572,16 +1685,17 @@ const WorkMode: React.FC = () => {
                                     onClick={() => {
                                       setModelCategoryTab(wf.id);
                                       setWorkflowMode(wf.id);
-                                      localStorage.setItem('exco:work:workflow-mode', wf.id);
+                                      sessionStorage.setItem('exco:work:workflow-mode', wf.id);
                                     }}
                                     className={cn(
-                                      'px-2 py-1 rounded-md text-[11px] font-medium transition-colors border text-center',
+                                      'min-w-0 w-full overflow-hidden inline-flex items-center justify-center gap-1 px-2 py-1.5 rounded-md text-[11px] font-medium transition-colors border whitespace-nowrap',
                                       modelCategoryTab === wf.id
                                         ? 'bg-[rgb(var(--color-primary))] dark:bg-[rgb(var(--color-primary))]/65 border-slate-900/15 dark:border-white/20 text-[rgb(var(--color-primary-foreground))]'
                                         : 'border-transparent text-[rgb(var(--color-foreground-muted))] hover:bg-[rgb(var(--color-surface-hover))]'
                                     )}
                                   >
-                                    {wf.label} ({wfCount})
+                                    <span className="truncate">{wf.label}</span>
+                                    <span className="flex-shrink-0 text-[10px] opacity-80">({wfCount})</span>
                                   </button>
                                 );
                               })}
@@ -1593,41 +1707,45 @@ const WorkMode: React.FC = () => {
                               role="button"
                               tabIndex={0}
                               onClick={() => {
-                                setSelectedModel('auto');
-                                localStorage.setItem('exco:work:preferred-model', 'auto');
+                                setSelectedModel('category-best');
+                                setWorkflowMode(modelCategoryTab);
+                                localStorage.setItem('exco:work:preferred-model', 'category-best');
+                                sessionStorage.setItem('exco:work:workflow-mode', modelCategoryTab);
                                 setShowModelSelector(false);
                               }}
                               onKeyDown={e => {
                                 if (e.key === 'Enter' || e.key === ' ') {
                                   e.preventDefault();
-                                  setSelectedModel('auto');
-                                  localStorage.setItem('exco:work:preferred-model', 'auto');
+                                  setSelectedModel('category-best');
+                                  setWorkflowMode(modelCategoryTab);
+                                  localStorage.setItem('exco:work:preferred-model', 'category-best');
+                                  sessionStorage.setItem('exco:work:workflow-mode', modelCategoryTab);
                                   setShowModelSelector(false);
                                 }
                               }}
                               className={cn(
                                 'w-full px-2.5 py-1.5 text-left text-xs rounded-lg flex items-center justify-between gap-2 cursor-pointer select-none transition-colors',
-                                selectedModel === 'auto'
+                                selectedModel === 'category-best'
                                   ? 'bg-[rgb(var(--color-primary))] dark:bg-[rgb(var(--color-primary))]/65 text-[rgb(var(--color-primary-foreground))] font-semibold'
                                   : 'hover:bg-[rgb(var(--color-surface-hover))]'
                               )}
                             >
                               <div className="flex items-center gap-1.5 min-w-0">
                                 <span className="truncate text-left">
-                                  Auto ({activeWorkflowLabel})
+                                  Best in {activeCategoryMeta.label}{topInTab ? ` · ${topInTab.name || topInTab.id}` : ''}
                                 </span>
-                                <InfoTip align="left" title="Auto Routing" text={AUTO_WORKFLOW_INFO.detail} />
+                                <InfoTip
+                                  align="left"
+                                  title={`Best in ${activeCategoryMeta.label}`}
+                                  text="Uses the highest-scoring Overview model in this category and switches across API keys automatically if quota runs out."
+                                />
                               </div>
-                              <span className="text-[10px] font-mono">
-                                {usageSummary && usageSummary.tokenCap ? `${formatCompactTokens(usageSummary.tokensUsed)}/${formatCompactTokens(usageSummary.tokenCap)}` : 'Auto'}
+                              <span className="text-[10px] font-mono flex-shrink-0">
+                                {topInTab ? `${topInTab.catScore}/100` : usageSummary && usageSummary.tokenCap ? `${formatCompactTokens(usageSummary.tokensUsed)}/${formatCompactTokens(usageSummary.tokenCap)}` : 'Top'}
                               </span>
                             </div>
 
-                            {availableModels
-                              .filter((m: any) => m.id !== 'auto')
-                              .filter((m: any) => !modelSearchQuery || `${m.id} ${m.name} ${m.keyName || ''} ${m.providerDisplayName || ''}`.toLowerCase().includes(modelSearchQuery.toLowerCase()))
-                              .filter((m: any) => (m.category || classifyModelCategory(m)) === modelCategoryTab)
-                              .map((m: any) => {
+                            {categoryModels.map((m: any) => {
                                 const sourceTag = m.keyName || m.providerDisplayName || getProviderDisplayName(m.providerId);
                                 const isFree = m.tier === 'free' || m.id.includes(':free');
                                 return (
@@ -1642,7 +1760,7 @@ const WorkMode: React.FC = () => {
                                       }
                                       setWorkflowMode(modelCategoryTab);
                                       localStorage.setItem('exco:work:preferred-model', m.id);
-                                      localStorage.setItem('exco:work:workflow-mode', modelCategoryTab);
+                                      sessionStorage.setItem('exco:work:workflow-mode', modelCategoryTab);
                                       setShowModelSelector(false);
                                     }}
                                     className={cn(
@@ -1651,9 +1769,13 @@ const WorkMode: React.FC = () => {
                                         ? 'bg-[rgb(var(--color-primary))] dark:bg-[rgb(var(--color-primary))]/65 text-[rgb(var(--color-primary-foreground))] font-semibold'
                                         : 'hover:bg-[rgb(var(--color-surface-hover))]'
                                     )}
+                                    title={`${m.id} · ${sourceTag} · Overview ${m.catScore}/100`}
                                   >
                                     <span className="truncate flex items-center gap-1.5 min-w-0">
                                       <span className="truncate">{m.name || m.id}</span>
+                                      <span className="px-1 py-0.2 rounded bg-sky-500/10 text-[9px] font-mono text-sky-400 flex-shrink-0">
+                                        {m.catScore}
+                                      </span>
                                       {sourceTag && (
                                         <span className="px-1.5 py-0.2 rounded bg-[rgb(var(--color-surface-hover))] text-[9px] text-[rgb(var(--color-foreground-muted))] flex-shrink-0">
                                           {sourceTag}
@@ -1688,7 +1810,8 @@ const WorkMode: React.FC = () => {
                             </button>
                           </div>
                         </div>
-                      )}
+                        );
+                      })()}
                     </div>
                   )}
                 </div>
@@ -1704,11 +1827,14 @@ const WorkMode: React.FC = () => {
                         setShowKeySelector(false);
                         setShowModelSelector(false);
                       }}
-                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[rgb(var(--color-foreground-muted))] hover:text-[rgb(var(--color-foreground))] hover:bg-[rgb(var(--color-surface-hover))] text-xs font-medium transition-colors whitespace-nowrap"
+                      className={cn(
+                        'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium transition-colors whitespace-nowrap',
+                        !workflowMode && apiKeys.length > 0
+                          ? 'text-amber-400 border border-amber-400/40 bg-amber-400/10 hover:bg-amber-400/15'
+                          : 'text-[rgb(var(--color-foreground-muted))] hover:text-[rgb(var(--color-foreground))] hover:bg-[rgb(var(--color-surface-hover))]'
+                      )}
                     >
-                      {workflowMode === 'auto' ? (
-                        <Wand2 className="w-3.5 h-3.5 text-emerald-400" />
-                      ) : workflowMode === 'turbo' ? (
+                      {workflowMode === 'turbo' ? (
                         <Zap className="w-3.5 h-3.5 text-amber-400" />
                       ) : workflowMode === 'deep-thought' ? (
                         <Brain className="w-3.5 h-3.5 text-purple-400" />
@@ -1728,12 +1854,9 @@ const WorkMode: React.FC = () => {
                         <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-[rgb(var(--color-foreground-muted))]">
                           Agent Workflow Mode
                         </div>
-                        {[
-                          { ...AUTO_WORKFLOW_INFO, id: 'auto' as const },
-                          ...WORKFLOW_CATEGORIES,
-                        ].map(modeItem => {
+                        {WORKFLOW_CATEGORIES.map(modeItem => {
                           const Icon =
-                            modeItem.id === 'auto' ? Wand2 : modeItem.id === 'turbo' ? Zap : modeItem.id === 'deep-thought' ? Brain : Sparkles;
+                            modeItem.id === 'turbo' ? Zap : modeItem.id === 'deep-thought' ? Brain : Sparkles;
                           return (
                             <div
                               key={modeItem.id}
@@ -1741,16 +1864,16 @@ const WorkMode: React.FC = () => {
                               tabIndex={0}
                               onClick={() => {
                                 setWorkflowMode(modeItem.id);
-                                setModelCategoryTab(modeItem.id === 'auto' ? 'turbo' : modeItem.id);
-                                localStorage.setItem('exco:work:workflow-mode', modeItem.id);
+                                setModelCategoryTab(modeItem.id);
+                                sessionStorage.setItem('exco:work:workflow-mode', modeItem.id);
                                 setShowModeSelector(false);
                               }}
                               onKeyDown={e => {
                                 if (e.key === 'Enter' || e.key === ' ') {
                                   e.preventDefault();
                                   setWorkflowMode(modeItem.id);
-                                  setModelCategoryTab(modeItem.id === 'auto' ? 'turbo' : modeItem.id);
-                                  localStorage.setItem('exco:work:workflow-mode', modeItem.id);
+                                  setModelCategoryTab(modeItem.id);
+                                  sessionStorage.setItem('exco:work:workflow-mode', modeItem.id);
                                   setShowModeSelector(false);
                                 }
                               }}
@@ -1794,7 +1917,7 @@ const WorkMode: React.FC = () => {
                   {/* Send / Execute Agent Button */}
                   <button
                     type="submit"
-                    disabled={(!input.trim() && attachedFiles.length === 0) || runningAgent}
+                    disabled={(!input.trim() && attachedFiles.length === 0) || runningAgent || (apiKeys.length > 0 && !workflowMode)}
                     className={cn(
                       'w-8 h-8 rounded-full flex items-center justify-center transition-all duration-200',
                       input.trim() || attachedFiles.length > 0

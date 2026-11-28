@@ -38,7 +38,9 @@ import {
   cleanTextForSpeech,
   stopAllVoiceAudio,
   playExclusiveAudioBase64,
+  playExclusiveAudioUrl,
   setLiveVoicePlaybackSpeed,
+  type ApiVoiceOption,
   type MicSensitivity,
 } from '../stores/voiceSettingsStore';
 import { useThemeStore, getSegmentStyle } from '../stores/themeStore';
@@ -86,6 +88,16 @@ export const VoiceChatPopup: React.FC<VoiceChatPopupProps> = ({
   const [entries, setEntries] = useState<VoiceTranscriptEntry[]>([]);
   const [ending, setEnding] = useState(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
+  const [apiVoices, setApiVoices] = useState<ApiVoiceOption[]>([]);
+
+  useEffect(() => {
+    const load = () => {
+      window.exco.chat.listApiVoices?.().then(list => setApiVoices(Array.isArray(list) ? list : [])).catch(() => {});
+    };
+    load();
+    window.addEventListener('exco:keys-updated', load);
+    return () => window.removeEventListener('exco:keys-updated', load);
+  }, []);
 
   // Mutable refs for audio loop & cancellation
   const isMountedRef = useRef(true);
@@ -159,14 +171,22 @@ export const VoiceChatPopup: React.FC<VoiceChatPopupProps> = ({
       }
 
       const settings = useVoiceSettingsStore.getState();
+      const isApiVoice =
+        settings.voiceModule === 'elevenlabs' ||
+        settings.voiceModule === 'gemini' ||
+        settings.voiceModule === 'openai' ||
+        settings.voiceModule === 'custom';
+      const synthKeyId = isApiVoice ? settings.apiVoiceKeyId || selectedKeyId || undefined : selectedKeyId || undefined;
       // Synthesize cleanly in background so playback starts immediately without starving the socket
       const synthPromise = window.exco.chat.synthesizeSpeech({
         text: spokenText,
         engine: settings.voiceModule,
         voice: resolveVoiceForModule(settings),
+        modelId: isApiVoice ? settings.apiVoiceModelId || undefined : undefined,
+        baseUrl: isApiVoice ? settings.apiVoiceBaseUrl || undefined : undefined,
         speed: settings.voiceSpeed,
         pitch: settings.voicePitch,
-        keyId: selectedKeyId || undefined,
+        keyId: synthKeyId,
       });
 
       speechQueuePromiseRef.current = speechQueuePromiseRef.current.then(async () => {
@@ -584,24 +604,38 @@ export const VoiceChatPopup: React.FC<VoiceChatPopupProps> = ({
     const audioToken = stopAllVoiceAudio();
     turnAudioTokenRef.current = audioToken;
     try {
-      const prebuiltBase64 = getInstantVoicePreviewAudio(latest.edgeVoice);
-      if (prebuiltBase64) {
-        await playExclusiveAudioBase64(
-          prebuiltBase64,
-          'audio/mpeg',
-          latest.voiceSpeed || 1.0,
-          audioToken
-        );
-        return;
+      if (latest.voiceModule === 'edge-neural') {
+        const prebuiltBase64 = getInstantVoicePreviewAudio(latest.edgeVoice);
+        if (prebuiltBase64) {
+          await playExclusiveAudioBase64(
+            prebuiltBase64,
+            'audio/mpeg',
+            latest.voiceSpeed || 1.0,
+            audioToken
+          );
+          return;
+        }
+      } else if (latest.apiVoicePreviewUrl) {
+        const resStatus = await playExclusiveAudioUrl(latest.apiVoicePreviewUrl, latest.voiceSpeed || 1.0, audioToken);
+        if (resStatus === 'played' || resStatus === 'aborted') return;
       }
+
+      const isApiVoice =
+        latest.voiceModule === 'elevenlabs' ||
+        latest.voiceModule === 'gemini' ||
+        latest.voiceModule === 'openai' ||
+        latest.voiceModule === 'custom';
+      const synthKeyId = isApiVoice ? latest.apiVoiceKeyId || selectedKeyId || undefined : selectedKeyId || undefined;
 
       const res = await window.exco.chat.synthesizeSpeech({
         text: VOICE_PREVIEW_SENTENCE,
         engine: latest.voiceModule,
         voice: resolveVoiceForModule(latest),
+        modelId: isApiVoice ? latest.apiVoiceModelId || undefined : undefined,
+        baseUrl: isApiVoice ? latest.apiVoiceBaseUrl || undefined : undefined,
         speed: latest.voiceSpeed,
         pitch: latest.voicePitch,
-        keyId: selectedKeyId || undefined,
+        keyId: synthKeyId,
       });
       if (ttsAbortTokenRef.current !== turnToken || aiMutedRef.current || endingRef.current) return;
       if (res?.warning) setErrorBanner(res.warning);
@@ -888,22 +922,51 @@ export const VoiceChatPopup: React.FC<VoiceChatPopupProps> = ({
 
             {/* Voice Module Quick Picker */}
             <div>
-              <div className="text-[11px] font-medium text-[rgb(var(--color-foreground-muted))] mb-1">
-                Voice Module
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-[11px] font-medium text-[rgb(var(--color-foreground-muted))]">
+                  Voice Module
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowCalibration(false);
+                    window.dispatchEvent(new CustomEvent('exco:open-settings', { detail: { tab: 'voice' } }));
+                  }}
+                  className="text-[10px] font-medium text-sky-400 hover:underline"
+                >
+                  + ElevenLabs / API Voices
+                </button>
               </div>
               <select
                 value={voiceSettings.selectedPresetId}
                 onChange={(e) => {
-                  voiceSettings.applyPreset(e.target.value);
+                  const val = e.target.value;
+                  const apiMatch = apiVoices.find(v => v.id === val);
+                  if (apiMatch) {
+                    voiceSettings.applyApiVoice(apiMatch);
+                  } else {
+                    voiceSettings.applyPreset(val);
+                  }
                   playVoiceSwitchSample();
                 }}
                 className="w-full text-xs bg-[rgb(var(--color-background))] border border-[rgb(var(--color-border))] rounded-lg px-2 py-1.5"
               >
-                {VOICE_MODULE_PRESETS.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.label}
-                  </option>
-                ))}
+                <optgroup label="Free Built-in (Edge Neural)">
+                  {VOICE_MODULE_PRESETS.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.label}
+                    </option>
+                  ))}
+                </optgroup>
+                {apiVoices.length > 0 && (
+                  <optgroup label="Extracted API Voices (All Connected Keys)">
+                    {apiVoices.map((v) => (
+                      <option key={v.id} value={v.id}>
+                        {v.name} ({v.category || v.engine})
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
               </select>
             </div>
 

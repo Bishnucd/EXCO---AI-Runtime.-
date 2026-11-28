@@ -36,7 +36,13 @@ import {
   routeTurnWithOverviewer,
   type RoutedCandidate,
 } from '@main/services/model-router';
-import { classifyModelCategory, inferProviderFromApiKey, resolveApiKeyProfile, isPathWithin } from '@shared/utils';
+import { classifyModelCategory, inferProviderFromApiKey, resolveApiKeyProfile, isPathWithin, type ModelCategory } from '@shared/utils';
+import {
+  WORKSPACE_ORGANIZATION_PROMPT,
+  resolveCleanWorkspaceWritePath,
+  findOrganizedFallbackPath,
+  formatWorkspaceFileContent,
+} from '@main/services/workspace-organizer';
 import type { ApiKeyEntry, PermissionLevel, ToolCall } from '@shared/types';
 
 const execAsync = promisify(exec);
@@ -242,7 +248,8 @@ async function listDirTool(allowedRoots: string[], primaryRoot: string, args: Re
 }
 
 async function readFileTool(allowedRoots: string[], primaryRoot: string, args: Record<string, any>): Promise<string> {
-  const targetFile = resolveWorkspaceTarget(allowedRoots, primaryRoot, String(args.path || ''));
+  const exactFile = resolveWorkspaceTarget(allowedRoots, primaryRoot, String(args.path || ''));
+  const targetFile = findOrganizedFallbackPath(exactFile, allowedRoots, primaryRoot);
   const raw = await fs.readFile(targetFile, 'utf8');
   const allLines = raw.split(/\r?\n/);
   const start = Math.max(1, Number(args.startLine) || 1);
@@ -297,15 +304,22 @@ async function searchFilesTool(allowedRoots: string[], primaryRoot: string, args
 }
 
 async function writeFileTool(allowedRoots: string[], primaryRoot: string, args: Record<string, any>): Promise<string> {
-  const targetFile = resolveWorkspaceTarget(allowedRoots, primaryRoot, String(args.path || ''));
-  const content = typeof args.content === 'string' ? args.content : '';
-  await fs.mkdir(path.dirname(targetFile), { recursive: true });
-  await fs.writeFile(targetFile, content, 'utf8');
-  return `Wrote ${content.length} chars to ${path.relative(primaryRoot, targetFile) || targetFile}`;
+  const exactTarget = resolveWorkspaceTarget(allowedRoots, primaryRoot, String(args.path || ''));
+  const targetRoot = allowedRoots.find(root => isPathWithin(root, exactTarget)) || primaryRoot;
+  const cleanTarget = resolveCleanWorkspaceWritePath(exactTarget, targetRoot);
+  const rawContent = typeof args.content === 'string' ? args.content : '';
+  const formattedContent = formatWorkspaceFileContent(cleanTarget.resolvedPath, rawContent);
+  await fs.mkdir(path.dirname(cleanTarget.resolvedPath), { recursive: true });
+  await fs.writeFile(cleanTarget.resolvedPath, formattedContent, 'utf8');
+  const rel = path.relative(primaryRoot, cleanTarget.resolvedPath) || cleanTarget.relativeToRoot;
+  return cleanTarget.redirectedFolder
+    ? `Wrote ${formattedContent.length} chars to ${rel} (cleanly organized under ${cleanTarget.redirectedFolder}/ — reference "./${cleanTarget.relativeToRoot}" if needed)`
+    : `Wrote ${formattedContent.length} chars to ${rel}`;
 }
 
 async function editFileTool(allowedRoots: string[], primaryRoot: string, args: Record<string, any>): Promise<string> {
-  const targetFile = resolveWorkspaceTarget(allowedRoots, primaryRoot, String(args.path || ''));
+  const exactFile = resolveWorkspaceTarget(allowedRoots, primaryRoot, String(args.path || ''));
+  const targetFile = findOrganizedFallbackPath(exactFile, allowedRoots, primaryRoot);
   const target = String(args.target ?? '');
   const replacement = String(args.replacement ?? '');
   if (!target) throw new Error('target snippet is required for edit_file');
@@ -319,17 +333,27 @@ async function editFileTool(allowedRoots: string[], primaryRoot: string, args: R
 }
 
 async function deleteFileTool(allowedRoots: string[], primaryRoot: string, args: Record<string, any>): Promise<string> {
-  const targetPath = resolveWorkspaceTarget(allowedRoots, primaryRoot, String(args.path || ''));
+  const exactPath = resolveWorkspaceTarget(allowedRoots, primaryRoot, String(args.path || ''));
+  const targetPath = findOrganizedFallbackPath(exactPath, allowedRoots, primaryRoot);
   if (!fsSync.existsSync(targetPath)) {
     throw new Error(`File does not exist: ${args.path}`);
   }
+  const rel = path.relative(primaryRoot, targetPath) || targetPath;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const electronMod = require('electron');
+    if (typeof electronMod?.shell?.trashItem === 'function') {
+      await electronMod.shell.trashItem(path.resolve(targetPath));
+      return `Moved ${rel} to Recycle Bin`;
+    }
+  } catch {}
   const stat = await fs.stat(targetPath);
   if (stat.isDirectory()) {
     await fs.rm(targetPath, { recursive: true, force: true });
   } else {
     await fs.unlink(targetPath);
   }
-  return `Deleted ${path.relative(primaryRoot, targetPath) || targetPath}`;
+  return `Deleted ${rel}`;
 }
 
 function validateShellCommandWithinWorkspace(command: string, allowedRoots: string[]): void {
@@ -544,7 +568,7 @@ export interface RunWorkspaceAgentInput {
   providerId?: string;
   keyId?: string;
   preferredFailover?: boolean;
-  workflowMode?: 'auto' | 'turbo' | 'standard' | 'deep-thought';
+  workflowMode?: ModelCategory;
   accessLevel: PermissionLevel;
   skillContext?: string;
 }
@@ -565,7 +589,7 @@ export async function runWorkspaceAgent(input: RunWorkspaceAgentInput): Promise<
     providerId: requestedProvider,
     keyId,
     preferredFailover = true,
-    workflowMode = 'auto',
+    workflowMode = 'standard',
     accessLevel,
     skillContext,
   } = input;
@@ -640,9 +664,9 @@ export async function runWorkspaceAgent(input: RunWorkspaceAgentInput): Promise<
   const decision = await routeTurnWithOverviewer({
     pool,
     promptText: promptStr,
-    requestedModel: requestedModel && requestedModel !== 'default' ? requestedModel : 'auto',
+    requestedModel: requestedModel && requestedModel !== 'default' ? requestedModel : undefined,
     preferredKeyId: keyId,
-    workflowMode: (workflowMode || 'auto') as any,
+    workflowMode,
     hasHeavyAttachments: false,
     hasAnyAttachment: Array.isArray(attachments) && attachments.length > 0,
     preferredFailover: preferredFailover !== false,
@@ -650,29 +674,8 @@ export async function runWorkspaceAgent(input: RunWorkspaceAgentInput): Promise<
     onStatus: (msg) => emitAgentEvent({ runId, type: 'status', message: msg }),
   });
 
-  // Strictly prioritize Tier 1 Leading models across connected keys in round-robin before Tier 2/3 fallbacks
-  const orderedPool = decision?.candidates || pool;
-  const candidates: RoutedCandidate[] = [];
-  for (const tier of [1, 2, 3] as const) {
-    const tierList = orderedPool.filter(c => getModelQualityTier(c.modelId, c.modelName) === tier);
-    const bucketsByKey = new Map<string, RoutedCandidate[]>();
-    for (const c of tierList) {
-      const list = bucketsByKey.get(c.keyId) || [];
-      list.push(c);
-      bucketsByKey.set(c.keyId, list);
-    }
-    let addedInPass = true;
-    while (addedInPass) {
-      addedInPass = false;
-      for (const list of bucketsByKey.values()) {
-        const nextCand = list.shift();
-        if (nextCand) {
-          candidates.push(nextCand);
-          addedInPass = true;
-        }
-      }
-    }
-  }
+  // Preserve router order: best Overview-scored model in chosen category first, trying ALL API keys for the same model before moving to next-best model
+  const candidates: RoutedCandidate[] = decision?.candidates || pool;
 
   const systemPrompt = [
     `You are EXCO Work Agent operating strictly inside the active project's folder sandbox.`,
@@ -708,6 +711,8 @@ export async function runWorkspaceAgent(input: RunWorkspaceAgentInput): Promise<
     '3. If a tool returns Permission denied by user, adapt and report clearly without retrying the denied call.',
     '4. When a task benefits from specialized engineering, API, security, frontend, or testing workflows, call search_ai_skills / load_ai_skill to use EXCO active AI Skills.',
     '5. When all needed actions are complete (or no workspace tools are needed), reply with a clear, concise final Markdown answer referencing exact files and observed command output.',
+    '',
+    WORKSPACE_ORGANIZATION_PROMPT,
     buildUniversalSkillsPrompt(typeof prompt === 'string' ? prompt : '', skillContext) || '',
   ].filter(Boolean).join('\n');
 

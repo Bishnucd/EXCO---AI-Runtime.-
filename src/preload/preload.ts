@@ -47,6 +47,7 @@ const appApi = {
   setConfig: createInvoke<Partial<AppConfig>, AppConfig>('app:set-config'),
   getVersion: createInvoke<void, { version: string; platform: string }>('app:ready'),
   quit: createInvoke<void, void>('app:quit'),
+  openExternal: createInvoke<string, boolean>('app:open-external'),
 };
 
 // ============================================================================
@@ -60,7 +61,7 @@ const chatApi = {
   deleteConversation: createInvoke<string, void>('chat:delete-conversation'),
   archiveConversation: createInvoke<string, Conversation>('chat:archive-conversation'),
   getMessages: createInvoke<string, Message[]>('chat:get-messages'),
-  sendMessage: createInvoke<{ conversationId: string; content: string | any[]; attachments?: any[]; modelId?: string; providerId?: string; keyId?: string; preferredFailover?: boolean; workflowMode?: 'auto' | 'turbo' | 'standard' | 'deep-thought'; skillContext?: string }, { aborted?: boolean; userMessage: Message; assistantMessage: Message; routing?: { taskType: string; selectedModel: string; selectedProvider: string; overviewerModelId?: string; failoverCount?: number } }>('chat:send-message'),
+  sendMessage: createInvoke<{ conversationId: string; content: string | any[]; attachments?: any[]; modelId?: string; providerId?: string; keyId?: string; preferredFailover?: boolean; workflowMode?: 'turbo' | 'standard' | 'deep-thought'; skillContext?: string }, { aborted?: boolean; userMessage: Message; assistantMessage: Message; routing?: { taskType: string; selectedModel: string; selectedProvider: string; overviewerModelId?: string; failoverCount?: number } }>('chat:send-message'),
   streamMessage: createInvoke<{ conversationId: string; content: string | any[]; modelId: string }, AsyncIterable<StreamChunk>>('chat:stream-message'),
   cancelStream: createInvoke<string, void>('chat:cancel-stream'),
   regenerateMessage: createInvoke<string, Message>('chat:regenerate-message'),
@@ -74,7 +75,7 @@ const chatApi = {
     providerId?: string;
     keyId?: string;
     preferredFailover?: boolean;
-    workflowMode?: 'auto' | 'turbo' | 'standard' | 'deep-thought';
+    workflowMode?: 'turbo' | 'standard' | 'deep-thought';
     skillContext?: string;
     language?: string;
   }, {
@@ -100,12 +101,27 @@ const chatApi = {
   }>('chat:save-voice-session'),
   synthesizeSpeech: createInvoke<{
     text: string;
-    engine?: 'edge-neural' | 'system';
+    engine?: 'edge-neural' | 'elevenlabs' | 'gemini' | 'openai' | 'custom' | 'system';
     voice?: string;
+    modelId?: string;
+    baseUrl?: string;
     speed?: number;
     pitch?: number;
     keyId?: string;
   }, { audioBase64?: string; mimeType?: string; source?: string; warning?: string; error?: string }>('chat:synthesize-speech'),
+  listApiVoices: createInvoke<void, Array<{
+    id: string;
+    engine: 'elevenlabs' | 'gemini' | 'openai' | 'custom';
+    keyId: string;
+    keyName: string;
+    voiceId: string;
+    modelId?: string;
+    baseUrl?: string;
+    name: string;
+    category?: string;
+    description?: string;
+    previewUrl?: string;
+  }>>('chat:list-api-voices'),
   warmTts: createInvoke<string | void, boolean>('chat:warm-tts'),
   listSystemVoices: createInvoke<void, Array<{ name: string; culture: string }>>('chat:list-system-voices'),
   onVoiceProgress: (listener: (ev: {
@@ -178,6 +194,7 @@ const fsApi = {
   readDir: createInvoke<string, FileSystemNode[]>('fs:read-dir'),
   readFile: createInvoke<string, { content: string; encoding: string }>('fs:read-file'),
   writeFile: createInvoke<{ path: string; content: string; encoding?: string }, void>('fs:write-file'),
+  exists: createInvoke<string, { exists: boolean; isDirectory: boolean }>('fs:exists'),
   delete: createInvoke<string, void>('fs:delete'),
   rename: createInvoke<{ oldPath: string; newPath: string }, void>('fs:rename'),
   createDir: createInvoke<string, void>('fs:create-dir'),
@@ -295,7 +312,7 @@ const workAgentApi = {
     providerId?: string;
     keyId?: string;
     preferredFailover?: boolean;
-    workflowMode?: 'auto' | 'turbo' | 'standard' | 'deep-thought';
+    workflowMode?: 'turbo' | 'standard' | 'deep-thought';
     accessLevel: 'ask' | 'selected-folder' | 'full-access';
     skillContext?: string;
   }, { conversationId: string; userMessage: any; assistantMessage: any; steps: any[] }>('work:run-agent'),

@@ -14,6 +14,10 @@ import {
   Square,
   Mic,
   Sliders,
+  Key,
+  ExternalLink,
+  RefreshCw,
+  Sparkles,
 } from 'lucide-react';
 import { cn } from '@shared/utils';
 import { useSettingsStore } from '../stores/settingsStore';
@@ -42,7 +46,9 @@ import {
   resolveVoiceForModule,
   stopAllVoiceAudio,
   playExclusiveAudioBase64,
+  playExclusiveAudioUrl,
   setLiveVoicePlaybackSpeed,
+  type ApiVoiceOption,
   type SpeechRecognitionEngine,
   type MicSensitivity,
 } from '../stores/voiceSettingsStore';
@@ -119,6 +125,33 @@ export function SettingsDrawer({ onClose, initialTab }: SettingsDrawerProps) {
   const voiceSettings = useVoiceSettingsStore();
   const [testingVoice, setTestingVoice] = useState(false);
   const sampleTokenRef = React.useRef(0);
+  const [apiVoices, setApiVoices] = useState<ApiVoiceOption[]>([]);
+  const [loadingApiVoices, setLoadingApiVoices] = useState(false);
+  const [showElevenLabsConnect, setShowElevenLabsConnect] = useState(false);
+  const [elevenLabsKeyInput, setElevenLabsKeyInput] = useState('');
+  const [savingElevenLabsKey, setSavingElevenLabsKey] = useState(false);
+  const [voiceSearchQuery, setVoiceSearchQuery] = useState('');
+
+  const loadApiVoices = React.useCallback(async () => {
+    setLoadingApiVoices(true);
+    try {
+      const list = await window.exco.chat.listApiVoices?.();
+      setApiVoices(Array.isArray(list) ? list : []);
+    } catch {
+      setApiVoices([]);
+    } finally {
+      setLoadingApiVoices(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === 'voice') {
+      loadApiVoices();
+    }
+    const onKeysChanged = () => loadApiVoices();
+    window.addEventListener('exco:keys-updated', onKeysChanged);
+    return () => window.removeEventListener('exco:keys-updated', onKeysChanged);
+  }, [activeTab, loadApiVoices]);
 
   useEffect(() => {
     if (voiceSettings.voiceModule === 'edge-neural') {
@@ -590,36 +623,62 @@ export function SettingsDrawer({ onClose, initialTab }: SettingsDrawerProps) {
     setTestingVoice(false);
   };
 
-  const playVoiceSample = async () => {
+  const playVoiceSample = async (overrideVoice?: ApiVoiceOption) => {
     const audioToken = stopAllVoiceAudio();
     const uiToken = ++sampleTokenRef.current;
     const latest = useVoiceSettingsStore.getState();
 
     setTestingVoice(true);
     try {
-      // Pre-built single-sentence preview per Edge Neural voice plays in <1ms with zero network wait
-      const prebuiltBase64 = getInstantVoicePreviewAudio(latest.edgeVoice);
-      if (prebuiltBase64) {
-        await playExclusiveAudioBase64(
-          prebuiltBase64,
-          'audio/mpeg',
-          latest.voiceSpeed || 1.0,
-          audioToken
-        );
-        if (sampleTokenRef.current === uiToken) {
-          setTestingVoice(false);
+      if (overrideVoice?.previewUrl) {
+        const resStatus = await playExclusiveAudioUrl(overrideVoice.previewUrl, latest.voiceSpeed || 1.0, audioToken);
+        if (resStatus === 'played' || resStatus === 'aborted') {
+          if (sampleTokenRef.current === uiToken) setTestingVoice(false);
+          return;
         }
-        return;
+      }
+
+      const activeEngine = overrideVoice ? overrideVoice.engine : latest.voiceModule;
+      const activeVoice = overrideVoice ? overrideVoice.voiceId : resolveVoiceForModule(latest);
+      const activeKeyId = overrideVoice ? overrideVoice.keyId : latest.apiVoiceKeyId || undefined;
+
+      // Pre-built single-sentence preview per Edge Neural voice plays in <1ms with zero network wait
+      if (activeEngine === 'edge-neural') {
+        const prebuiltBase64 = getInstantVoicePreviewAudio(latest.edgeVoice);
+        if (prebuiltBase64) {
+          await playExclusiveAudioBase64(
+            prebuiltBase64,
+            'audio/mpeg',
+            latest.voiceSpeed || 1.0,
+            audioToken
+          );
+          if (sampleTokenRef.current === uiToken) {
+            setTestingVoice(false);
+          }
+          return;
+        }
+      } else if (!overrideVoice && latest.apiVoicePreviewUrl) {
+        const resStatus = await playExclusiveAudioUrl(latest.apiVoicePreviewUrl, latest.voiceSpeed || 1.0, audioToken);
+        if (resStatus === 'played' || resStatus === 'aborted') {
+          if (sampleTokenRef.current === uiToken) setTestingVoice(false);
+          return;
+        }
       }
 
       const res = await window.exco.chat.synthesizeSpeech({
         text: VOICE_PREVIEW_SENTENCE,
-        engine: latest.voiceModule,
-        voice: resolveVoiceForModule(latest),
+        engine: activeEngine,
+        voice: activeVoice,
+        modelId: overrideVoice ? overrideVoice.modelId : latest.apiVoiceModelId || undefined,
+        baseUrl: overrideVoice ? overrideVoice.baseUrl : latest.apiVoiceBaseUrl || undefined,
         speed: latest.voiceSpeed,
         pitch: latest.voicePitch,
+        keyId: activeKeyId,
       });
       if (sampleTokenRef.current !== uiToken) return;
+      if (res?.warning) {
+        showNotice('error', res.warning);
+      }
       if (res?.audioBase64) {
         await playExclusiveAudioBase64(
           res.audioBase64,
@@ -640,6 +699,35 @@ export function SettingsDrawer({ onClose, initialTab }: SettingsDrawerProps) {
       }
     } catch {
       if (sampleTokenRef.current === uiToken) setTestingVoice(false);
+    }
+  };
+
+  const handleOpenElevenLabsPortal = async () => {
+    setShowElevenLabsConnect(true);
+    try {
+      await window.exco.app.openExternal('https://elevenlabs.io/app/settings/api-keys');
+    } catch {}
+    showNotice('success', 'Opened ElevenLabs in your browser — sign in, copy your API key, and paste it below.');
+  };
+
+  const handleSaveElevenLabsKey = async () => {
+    const cleanKey = elevenLabsKeyInput.trim();
+    if (!cleanKey) return;
+    setSavingElevenLabsKey(true);
+    try {
+      const created = await window.exco.keys.create({
+        keyName: 'ElevenLabs',
+        key: cleanKey,
+      });
+      setElevenLabsKeyInput('');
+      setShowElevenLabsConnect(false);
+      window.dispatchEvent(new CustomEvent('exco:keys-updated', { detail: { keyId: created?.id } }));
+      await loadApiVoices();
+      showNotice('success', 'ElevenLabs API key saved! Extracted available voices below.');
+    } catch (err: any) {
+      showNotice('error', err?.message || 'Failed to save ElevenLabs API key');
+    } finally {
+      setSavingElevenLabsKey(false);
     }
   };
 
@@ -736,6 +824,221 @@ export function SettingsDrawer({ onClose, initialTab }: SettingsDrawerProps) {
           })}
         </div>
       </section>
+
+      {/* ElevenLabs Voice Modules (External Sign-In -> Paste API Key -> Extract Voices) */}
+      {(() => {
+        const elevenLabsVoices = apiVoices.filter(v => v.engine === 'elevenlabs');
+        const otherApiVoices = apiVoices.filter(v => v.engine !== 'elevenlabs');
+        const queryL = voiceSearchQuery.trim().toLowerCase();
+        const filteredEleven = elevenLabsVoices.filter(
+          v => !queryL || v.name.toLowerCase().includes(queryL) || (v.description || '').toLowerCase().includes(queryL)
+        );
+        const filteredOther = otherApiVoices.filter(
+          v => !queryL || v.name.toLowerCase().includes(queryL) || v.engine.toLowerCase().includes(queryL)
+        );
+
+        return (
+          <>
+            <section className="rounded-xl border border-[rgb(var(--color-border))] bg-[rgb(var(--color-surface))] p-4 space-y-3 shadow-sm">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5">
+                  <Sparkles className="w-4 h-4 text-amber-400" />
+                  <span className="text-sm font-semibold text-[rgb(var(--color-foreground))]">ElevenLabs Voice Modules</span>
+                  <InfoTip
+                    align="left"
+                    title="ElevenLabs API Voices"
+                    text="Click Get API Key to sign in at ElevenLabs in your browser (Free tier: 10,000 credits/mo), then paste your API key to extract and preview your ElevenLabs voices."
+                  />
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={handleOpenElevenLabsPortal}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-lg border border-amber-500/40 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20"
+                  >
+                    <ExternalLink className="w-3 h-3" />
+                    <span>{elevenLabsVoices.length > 0 ? 'Add / Open ElevenLabs' : 'Sign In & Get API Key'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={loadApiVoices}
+                    disabled={loadingApiVoices}
+                    className="p-1.5 rounded-lg border border-[rgb(var(--color-border))] hover:bg-[rgb(var(--color-surface-hover))] text-[rgb(var(--color-foreground-muted))]"
+                    title="Refresh extracted API voices"
+                  >
+                    <RefreshCw className={cn('w-3.5 h-3.5', loadingApiVoices && 'animate-spin')} />
+                  </button>
+                </div>
+              </div>
+
+              {(elevenLabsVoices.length === 0 || showElevenLabsConnect) && (
+                <div className="p-3 rounded-xl border border-amber-500/30 bg-amber-500/5 space-y-2.5">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="text-xs text-[rgb(var(--color-foreground-muted))] leading-relaxed">
+                      <span className="font-semibold text-[rgb(var(--color-foreground))]">Connect ElevenLabs:</span>{' '}
+                      Sign in on ElevenLabs in your external browser, create/copy your API key, and paste it below to extract your voices into Voice Previewer &amp; Voice Chat.
+                    </div>
+                    {elevenLabsVoices.length === 0 && (
+                      <button
+                        type="button"
+                        onClick={handleOpenElevenLabsPortal}
+                        className="px-2.5 py-1 rounded-lg bg-amber-500/20 text-amber-300 text-[11px] font-semibold whitespace-nowrap flex-shrink-0 hover:bg-amber-500/30"
+                      >
+                        Open ElevenLabs
+                      </button>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="relative flex-1">
+                      <Key className="w-3.5 h-3.5 text-[rgb(var(--color-foreground-muted))] absolute left-2.5 top-1/2 -translate-y-1/2" />
+                      <input
+                        type="password"
+                        value={elevenLabsKeyInput}
+                        onChange={e => setElevenLabsKeyInput(e.target.value)}
+                        placeholder="Paste ElevenLabs API key (sk_...)"
+                        className="w-full pl-8 pr-3 py-1.5 text-xs rounded-lg bg-[rgb(var(--color-background))] border border-[rgb(var(--color-border))]"
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      disabled={!elevenLabsKeyInput.trim() || savingElevenLabsKey}
+                      onClick={handleSaveElevenLabsKey}
+                      className="px-3 py-1.5 rounded-lg bg-[rgb(var(--color-primary))] text-[rgb(var(--color-primary-foreground))] text-xs font-semibold whitespace-nowrap disabled:opacity-50"
+                    >
+                      {savingElevenLabsKey ? 'Extracting...' : 'Save & Extract Voices'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {apiVoices.length > 4 && (
+                <input
+                  type="text"
+                  value={voiceSearchQuery}
+                  onChange={e => setVoiceSearchQuery(e.target.value)}
+                  placeholder="Search extracted API voices..."
+                  className="w-full px-3 py-1.5 text-xs rounded-lg bg-[rgb(var(--color-background))] border border-[rgb(var(--color-border))]"
+                />
+              )}
+
+              {filteredEleven.length > 0 && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-56 overflow-y-auto pr-1">
+                  {filteredEleven.map(v => {
+                    const active = voiceSettings.selectedPresetId === v.id;
+                    return (
+                      <div
+                        key={v.id}
+                        className={cn(
+                          'p-2.5 rounded-xl border transition-all flex items-center justify-between gap-2',
+                          active
+                            ? 'border-amber-400/70 bg-amber-500/10 ring-1 ring-amber-400/30'
+                            : 'border-[rgb(var(--color-border))] hover:bg-[rgb(var(--color-surface-hover))]'
+                        )}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => {
+                            voiceSettings.applyApiVoice(v);
+                            showNotice('success', `Voice module set to ${v.name} (ElevenLabs).`);
+                            playVoiceSample(v);
+                          }}
+                          className="min-w-0 flex-1 text-left"
+                        >
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-xs font-semibold text-[rgb(var(--color-foreground))] truncate">{v.name}</span>
+                            {active && (
+                              <span className="px-1.5 py-0.2 rounded text-[9px] font-semibold bg-amber-500/20 text-amber-400 flex-shrink-0">
+                                Active
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[10px] text-[rgb(var(--color-foreground-muted))] truncate">
+                            {v.description || v.category || 'ElevenLabs Voice'}
+                          </p>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => playVoiceSample(v)}
+                          className="p-1.5 rounded-lg border border-[rgb(var(--color-border))] hover:bg-[rgb(var(--color-surface-hover))] text-sky-400 flex-shrink-0"
+                          title={`Preview ${v.name}`}
+                        >
+                          <Play className="w-3 h-3" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+
+            {/* Connected Gemini & OpenAI API Voices */}
+            {filteredOther.length > 0 && (
+              <section className="rounded-xl border border-[rgb(var(--color-border))] bg-[rgb(var(--color-surface))] p-4 space-y-3 shadow-sm">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5">
+                    <Volume2 className="w-4 h-4 text-purple-400" />
+                    <span className="text-sm font-semibold text-[rgb(var(--color-foreground))]">
+                      Extracted API Key Voices (All Connected Keys)
+                    </span>
+                  </div>
+                  <span className="text-[11px] font-mono text-[rgb(var(--color-foreground-muted))]">
+                    {filteredOther.length} voices
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-56 overflow-y-auto pr-1">
+                  {filteredOther.map(v => {
+                    const active = voiceSettings.selectedPresetId === v.id;
+                    return (
+                      <div
+                        key={v.id}
+                        className={cn(
+                          'p-2.5 rounded-xl border transition-all flex items-center justify-between gap-2',
+                          active
+                            ? 'border-purple-400/70 bg-purple-500/10 ring-1 ring-purple-400/30'
+                            : 'border-[rgb(var(--color-border))] hover:bg-[rgb(var(--color-surface-hover))]'
+                        )}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => {
+                            voiceSettings.applyApiVoice(v);
+                            showNotice('success', `Voice module set to ${v.name}.`);
+                            playVoiceSample(v);
+                          }}
+                          className="min-w-0 flex-1 text-left"
+                        >
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-xs font-semibold text-[rgb(var(--color-foreground))] truncate">{v.name}</span>
+                            <span className="px-1 py-0.2 rounded bg-[rgb(var(--color-surface-hover))] text-[9px] uppercase text-[rgb(var(--color-foreground-muted))] flex-shrink-0">
+                              {v.engine}
+                            </span>
+                            {active && (
+                              <span className="px-1.5 py-0.2 rounded text-[9px] font-semibold bg-purple-500/20 text-purple-400 flex-shrink-0">
+                                Active
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[10px] text-[rgb(var(--color-foreground-muted))] truncate">
+                            {v.description || v.keyName}
+                          </p>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => playVoiceSample(v)}
+                          className="p-1.5 rounded-lg border border-[rgb(var(--color-border))] hover:bg-[rgb(var(--color-surface-hover))] text-sky-400 flex-shrink-0"
+                          title={`Preview ${v.name}`}
+                        >
+                          <Play className="w-3 h-3" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
+          </>
+        );
+      })()}
 
       {/* Speed, Pitch & Speech Recognition */}
       <section className="rounded-xl border border-[rgb(var(--color-border))] bg-[rgb(var(--color-surface))] divide-y divide-[rgb(var(--color-border))] shadow-sm">

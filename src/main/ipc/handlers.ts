@@ -37,7 +37,6 @@ import {
   StreamChunk,
   IPCChannels,
 } from '@shared/types';
-import { classifyModelCategory } from '@shared/utils';
 import {
   initializeDatabase,
   getDatabase,
@@ -103,6 +102,9 @@ import {
   inferProviderFromApiKey,
   resolveApiKeyProfile,
   inferModelTier,
+  computeModelBenchmarks,
+  scoreModelForWorkflowCategory,
+  type ModelCategory,
   serializeVoiceSession,
   stripVoiceSessionMarkerForContext,
 } from '@shared/utils';
@@ -580,7 +582,7 @@ async function ensureProviderForKey(
     if (liveInst) liveInst.updateConfig({ apiKey: secret });
   }
 
-  if (matching && (fetchModels || !Array.isArray(matching.models) || matching.models.length === 0)) {
+  if (matching && !profile.baseUrl?.includes('elevenlabs.io') && (fetchModels || !Array.isArray(matching.models) || matching.models.length === 0)) {
     try {
       const inst = providerManager.getProvider(matching.id);
       if (inst) {
@@ -641,6 +643,13 @@ export function registerAppHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.APP_SET_CONFIG, async (_event, updates: Partial<AppConfig>) => {
     currentConfig = { ...currentConfig, ...updates };
     return currentConfig;
+  });
+
+  ipcMain.handle('app:open-external', async (_event, rawUrl: string) => {
+    const clean = (rawUrl || '').trim();
+    if (!/^https?:\/\//i.test(clean)) return false;
+    await shell.openExternal(clean);
+    return true;
   });
 }
 
@@ -829,12 +838,17 @@ export function registerChatHandlers(): void {
       );
       const hasAnyAttachment = partsList.some((p: any) => p?.type === 'image' || p?.type === 'file');
 
+      const activeWorkflow: ModelCategory =
+        workflowMode === 'turbo' || workflowMode === 'standard' || workflowMode === 'deep-thought'
+          ? workflowMode
+          : 'standard';
+
       const decision = await routeTurnWithOverviewer({
         pool,
         promptText,
         requestedModel: modelId,
         preferredKeyId: keyId,
-        workflowMode: (workflowMode || 'auto') as any,
+        workflowMode: activeWorkflow,
         reasoningEffort: conv?.reasoningEffort,
         hasHeavyAttachments,
         hasAnyAttachment,
@@ -848,15 +862,13 @@ export function registerChatHandlers(): void {
       }
 
       const taskLabel =
-        decision.taskType === 'higher-research'
-          ? 'Research'
-          : decision.taskType === 'documentation'
-          ? 'Docs'
-          : decision.taskType === 'coding'
-          ? 'Code'
-          : 'Fast';
+        activeWorkflow === 'deep-thought'
+          ? 'Deep Thought'
+          : activeWorkflow === 'turbo'
+          ? 'Turbo'
+          : 'Standard';
 
-      // Inform renderer immediately which task category & model was selected
+      // Inform renderer immediately which category & top Overview model was selected
       sendToRenderer('chat:live-progress', {
         conversationId,
         type: 'routing',
@@ -864,20 +876,11 @@ export function registerChatHandlers(): void {
         modelId: decision.selected.modelId,
         providerId: decision.selected.providerId,
         overviewerModelId: decision.overviewerUsed?.modelId,
-        statusText: decision.triggeredByKeyword
-          ? `Selected ${decision.selected.modelId} (${taskLabel}) — generating reply...`
-          : `Generating reply with ${decision.selected.modelId}...`,
+        statusText: `Selected ${decision.selected.modelId} (${taskLabel}) — generating reply...`,
       });
 
-      // Prioritize Tier 1 Leading models across failover before secondary/obscure options
-      const candidatesToTry: RoutedCandidate[] = [];
-      for (const tier of [1, 2, 3] as const) {
-        for (const c of decision.candidates) {
-          if (getModelQualityTier(c.modelId, c.modelName) === tier) {
-            candidatesToTry.push(c);
-          }
-        }
-      }
+      // Preserve exact router priority: same best model across other API keys before next-best model
+      const candidatesToTry: RoutedCandidate[] = decision.candidates;
       let assistantContent = '';
       let tokens: any = undefined;
       let failoverTransitionNote = '';
@@ -1092,8 +1095,8 @@ export function registerChatHandlers(): void {
             }
           }
           updateConversation(conversationId, {
-            modelId: isAutoRequested ? 'auto' : finalModelId,
-            providerId: isAutoRequested ? 'auto' : cand.providerId,
+            modelId: finalModelId,
+            providerId: cand.providerId,
           });
           usedModelId = finalModelId;
           usedProviderId = cand.providerId;
@@ -1662,7 +1665,7 @@ export function registerChatHandlers(): void {
     providerId?: string;
     keyId?: string;
     preferredFailover?: boolean;
-    workflowMode?: 'auto' | 'turbo' | 'standard' | 'deep-thought';
+    workflowMode?: 'turbo' | 'standard' | 'deep-thought';
     skillContext?: string;
     language?: string;
   }) => {
@@ -2142,16 +2145,235 @@ export function registerChatHandlers(): void {
     }
   });
 
+  ipcMain.handle('chat:list-api-voices', async () => {
+    const allKeys = getApiKeys();
+    const dbProviders = getProviders();
+    const results: Array<{
+      id: string;
+      engine: 'elevenlabs' | 'gemini' | 'openai' | 'custom';
+      keyId: string;
+      keyName: string;
+      voiceId: string;
+      modelId?: string;
+      baseUrl?: string;
+      name: string;
+      category?: string;
+      description?: string;
+      previewUrl?: string;
+    }> = [];
+    const seenIds = new Set<string>();
+    const pushVoice = (item: (typeof results)[number]) => {
+      if (seenIds.has(item.id)) return;
+      seenIds.add(item.id);
+      results.push(item);
+    };
+
+    const GEMINI_PREBUILT_VOICES = [
+      { voiceId: 'Kore', name: 'Kore (Gemini Natural Female)', description: 'Firm, clear conversational voice (supports Hindi & 70+ languages)' },
+      { voiceId: 'Aoede', name: 'Aoede (Gemini Warm Female)', description: 'Breezy, expressive natural female voice' },
+      { voiceId: 'Leda', name: 'Leda (Gemini Youthful Female)', description: 'Bright, friendly conversational voice' },
+      { voiceId: 'Zephyr', name: 'Zephyr (Gemini Bright)', description: 'Clear, upbeat voice for assistants' },
+      { voiceId: 'Puck', name: 'Puck (Gemini Upbeat Male)', description: 'Energetic, warm conversational male voice' },
+      { voiceId: 'Charon', name: 'Charon (Gemini Calm Male)', description: 'Informative, steady voice for explanations' },
+      { voiceId: 'Fenrir', name: 'Fenrir (Gemini Expressive Male)', description: 'Excitable, dynamic voice' },
+      { voiceId: 'Orus', name: 'Orus (Gemini Firm Male)', description: 'Grounded, composed voice' },
+    ];
+
+    const OPENAI_TTS_VOICES = [
+      { voiceId: 'nova', name: 'Nova (OpenAI Female)', description: 'Warm, natural conversational female voice' },
+      { voiceId: 'shimmer', name: 'Shimmer (OpenAI Female)', description: 'Soft, expressive voice' },
+      { voiceId: 'coral', name: 'Coral (OpenAI Warm)', description: 'Clear, engaging conversational voice' },
+      { voiceId: 'alloy', name: 'Alloy (OpenAI Balanced)', description: 'Neutral, balanced studio voice' },
+      { voiceId: 'sage', name: 'Sage (OpenAI Calm)', description: 'Measured, thoughtful voice' },
+      { voiceId: 'echo', name: 'Echo (OpenAI Male)', description: 'Smooth, resonant male voice' },
+      { voiceId: 'onyx', name: 'Onyx (OpenAI Deep Male)', description: 'Deep, authoritative voice' },
+    ];
+
+    const isVoiceTtsModel = (modelId: string, modelName = ''): boolean => {
+      const text = `${modelId} ${modelName}`.toLowerCase();
+      return /(tts|speech|audio-preview|native-audio|orpheus|playai|kokoro|bark|xtts|chatterbox|voice|sonic)/.test(text) &&
+        !/(whisper|transcribe|stt|asr)/.test(text);
+    };
+
+    await Promise.all(
+      allKeys.map(async entry => {
+        const secret = await resolveKeySecretForRouter(entry).catch(() => null);
+        if (!secret) return;
+        const profile = resolveApiKeyProfile(secret, entry.providerId, entry.keyName);
+        const resolvedType = inferProviderFromApiKey(secret, profile.providerId);
+        const isElevenLabs =
+          secret.trim().startsWith('sk_') ||
+          (profile.baseUrl || '').includes('elevenlabs.io') ||
+          (entry.keyName || '').toLowerCase().includes('eleven');
+
+        if (isElevenLabs) {
+          try {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 5000);
+            const resp = await fetch('https://api.elevenlabs.io/v1/voices', {
+              headers: { 'xi-api-key': secret.trim() },
+              signal: ctrl.signal,
+            }).finally(() => clearTimeout(timer));
+            if (resp.ok) {
+              const data: any = await resp.json().catch(() => null);
+              const voicesList = Array.isArray(data?.voices) ? data.voices : [];
+              for (const v of voicesList) {
+                if (!v?.voice_id) continue;
+                const labelParts = v.labels && typeof v.labels === 'object'
+                  ? Object.values(v.labels).filter(Boolean).slice(0, 3).join(' · ')
+                  : '';
+                pushVoice({
+                  id: `elevenlabs:${entry.id}:${v.voice_id}`,
+                  engine: 'elevenlabs',
+                  keyId: entry.id,
+                  keyName: entry.keyName || 'ElevenLabs',
+                  voiceId: String(v.voice_id),
+                  name: String(v.name || v.voice_id),
+                  category: v.category ? String(v.category) : 'elevenlabs',
+                  description: String(v.description || labelParts || 'ElevenLabs Voice'),
+                  previewUrl: typeof v.preview_url === 'string' ? v.preview_url : undefined,
+                });
+              }
+            }
+          } catch {}
+          return;
+        }
+
+        // Discover any TTS/Voice models dynamically from the provider's live/cached model catalog
+        const matchingProv = dbProviders.find(
+          p =>
+            (entry.keyName && p.name?.toLowerCase() === entry.keyName.toLowerCase()) ||
+            (profile.baseUrl && (p.config?.baseUrl || '').toLowerCase().includes(profile.baseUrl.toLowerCase())) ||
+            (resolvedType !== 'custom' && p.type === resolvedType)
+        );
+        let rawModels: any[] = Array.isArray(matchingProv?.models) ? matchingProv!.models : [];
+        if (rawModels.length === 0 && profile.baseUrl) {
+          try {
+            const cleanBase = profile.baseUrl.replace(/\/+$/, '');
+            const modelsUrl =
+              resolvedType === 'google'
+                ? `${cleanBase}/models`
+                : cleanBase.endsWith('/v1')
+                ? `${cleanBase}/models`
+                : `${cleanBase}/v1/models`;
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 3000);
+            const resp = await fetch(modelsUrl, {
+              headers:
+                resolvedType === 'google'
+                  ? { 'x-goog-api-key': secret.trim() }
+                  : { Authorization: `Bearer ${secret.trim()}` },
+              signal: ctrl.signal,
+            }).finally(() => clearTimeout(timer));
+            if (resp.ok) {
+              const json: any = await resp.json().catch(() => null);
+              rawModels = Array.isArray(json?.data) ? json.data : Array.isArray(json?.models) ? json.models : [];
+            }
+          } catch {}
+        }
+
+        const discoveredTtsModels = rawModels.filter(m => {
+          const mId = String(m?.id || m?.name || '').replace(/^models\//, '');
+          return Boolean(mId) && isVoiceTtsModel(mId, m?.displayName || m?.name || '');
+        });
+
+        if (resolvedType === 'google') {
+          const geminiTtsModel =
+            discoveredTtsModels.find(m => String(m?.id || m?.name || '').toLowerCase().includes('tts'))?.id ||
+            'gemini-2.5-flash-preview-tts';
+          for (const gv of GEMINI_PREBUILT_VOICES) {
+            pushVoice({
+              id: `gemini:${entry.id}:${gv.voiceId}`,
+              engine: 'gemini',
+              keyId: entry.id,
+              keyName: entry.keyName || 'Google Gemini',
+              voiceId: gv.voiceId,
+              modelId: String(geminiTtsModel).replace(/^models\//, ''),
+              name: gv.name,
+              category: 'gemini',
+              description: `${gv.description} · ${entry.keyName || 'Gemini'}`,
+            });
+          }
+        } else if (resolvedType === 'openai') {
+          for (const ov of OPENAI_TTS_VOICES) {
+            pushVoice({
+              id: `openai:${entry.id}:${ov.voiceId}`,
+              engine: 'openai',
+              keyId: entry.id,
+              keyName: entry.keyName || 'OpenAI',
+              voiceId: ov.voiceId,
+              modelId: 'gpt-4o-mini-tts',
+              name: ov.name,
+              category: 'openai',
+              description: `${ov.description} · ${entry.keyName || 'OpenAI'}`,
+            });
+          }
+        }
+
+        // Expose every custom/gateway TTS voice model returned by this API key (e.g. Groq PlayAI/Orpheus, Together, OpenAI-compat)
+        for (const m of discoveredTtsModels) {
+          const mId = String(m?.id || m?.name || '').replace(/^models\//, '');
+          if (!mId) continue;
+          if (resolvedType === 'google' && mId.includes('gemini-2.5-flash-preview-tts')) continue;
+          if (resolvedType === 'openai' && /^(tts-1|tts-1-hd|gpt-4o-mini-tts)$/i.test(mId)) continue;
+          const display = String(m?.displayName || m?.name || mId);
+          const cleanBase = (profile.baseUrl || matchingProv?.config?.baseUrl || '').replace(/\/+$/, '');
+          if (!cleanBase) continue;
+          const defaultVoice = mId.toLowerCase().includes('orpheus')
+            ? 'tara'
+            : mId.toLowerCase().includes('playai')
+            ? 'Fritz-PlayAI'
+            : 'alloy';
+          pushVoice({
+            id: `custom:${entry.id}:${mId}`,
+            engine: 'custom',
+            keyId: entry.id,
+            keyName: entry.keyName || profile.displayName,
+            voiceId: defaultVoice,
+            modelId: mId,
+            baseUrl: cleanBase,
+            name: `${display}`,
+            category: profile.displayName,
+            description: `${entry.keyName || profile.displayName} · Model: ${mId}`,
+          });
+        }
+      })
+    );
+
+    return results;
+  });
+
   ipcMain.handle('chat:warm-tts', async (_event, voiceName?: string) => {
     // Also pre-warm the model router pool in background so Turn 1 selection hits 0ms cache
     collectAllModelCandidates(getApiKeys(), resolveKeySecretForRouter).catch(() => {});
     return warmEdgeTtsClient(voiceName);
   });
 
+  const wrapPcm24kToWavBase64 = (pcmBuf: Buffer): string => {
+    const sampleRate = 24000;
+    const header = Buffer.alloc(44);
+    header.write('RIFF', 0);
+    header.writeUInt32LE(36 + pcmBuf.length, 4);
+    header.write('WAVE', 8);
+    header.write('fmt ', 12);
+    header.writeUInt32LE(16, 16);
+    header.writeUInt16LE(1, 20);
+    header.writeUInt16LE(1, 22);
+    header.writeUInt32LE(sampleRate, 24);
+    header.writeUInt32LE(sampleRate * 2, 28);
+    header.writeUInt16LE(2, 32);
+    header.writeUInt16LE(16, 34);
+    header.write('data', 36);
+    header.writeUInt32LE(pcmBuf.length, 40);
+    return Buffer.concat([header, pcmBuf]).toString('base64');
+  };
+
   ipcMain.handle('chat:synthesize-speech', async (_event, input: {
     text: string;
-    engine?: 'edge-neural' | 'system';
+    engine?: 'edge-neural' | 'elevenlabs' | 'gemini' | 'openai' | 'custom' | 'system';
     voice?: string;
+    modelId?: string;
+    baseUrl?: string;
     speed?: number;
     pitch?: number;
     keyId?: string;
@@ -2159,9 +2381,9 @@ export function registerChatHandlers(): void {
     const text = (input?.text || '').trim();
     if (!text) return { error: 'Empty text' };
 
-    const requestedEngine = input?.engine === 'system' ? 'system' : 'edge-neural';
-    const requestedVoice = (input?.voice || 'en-US-JennyNeural').trim();
-    const cacheKey = text.length <= 280 ? `${requestedEngine}::${requestedVoice}::${text}` : '';
+    const requestedEngine = input?.engine || 'edge-neural';
+    const requestedVoice = (input?.voice || 'en-US-AvaNeural').trim();
+    const cacheKey = text.length <= 280 ? `${requestedEngine}::${input?.keyId || ''}::${requestedVoice}::${text}` : '';
     if (cacheKey) {
       const cached = getCachedTtsAudio(cacheKey);
       if (cached) {
@@ -2169,12 +2391,201 @@ export function registerChatHandlers(): void {
       }
     }
 
-    // 1. Primary Microsoft Edge Neural Voice (msedge-tts)
-    if (requestedEngine === 'edge-neural') {
-      const edgeResult = await runEdgeTtsSynthesis(text, requestedVoice);
+    let apiFallbackWarning = '';
+
+    // 0A. ElevenLabs API Synthesis
+    if (requestedEngine === 'elevenlabs' && requestedVoice) {
+      const allKeys = getApiKeys();
+      const targetKeyEntry =
+        (input?.keyId ? allKeys.find(k => k.id === input.keyId) : undefined) ||
+        allKeys.find(k => (k.keyName || '').toLowerCase().includes('eleven'));
+      const secret = targetKeyEntry ? await resolveKeySecretForRouter(targetKeyEntry).catch(() => null) : null;
+      if (secret) {
+        try {
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), 9000);
+          const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(requestedVoice)}`, {
+            method: 'POST',
+            headers: {
+              'xi-api-key': secret.trim(),
+              'Content-Type': 'application/json',
+              Accept: 'audio/mpeg',
+            },
+            body: JSON.stringify({
+              text: text.slice(0, 2500),
+              model_id: 'eleven_flash_v2_5',
+            }),
+            signal: ctrl.signal,
+          }).finally(() => clearTimeout(timer));
+          if (resp.ok) {
+            const arrBuf = await resp.arrayBuffer();
+            const b64 = Buffer.from(arrBuf).toString('base64');
+            if (b64) {
+              const out = { audioBase64: b64, mimeType: 'audio/mpeg', source: 'elevenlabs' };
+              if (cacheKey) setCachedTtsAudio(cacheKey, out);
+              return out;
+            }
+          } else {
+            const errTxt = await resp.text().catch(() => '');
+            apiFallbackWarning = `ElevenLabs (${resp.status}) unavailable — using Edge Neural fallback.`;
+            console.warn('[TTS] ElevenLabs error:', resp.status, errTxt.slice(0, 200));
+          }
+        } catch (err: any) {
+          apiFallbackWarning = `ElevenLabs timeout/error — using Edge Neural fallback.`;
+          console.warn('[TTS] ElevenLabs fetch failed:', err?.message || err);
+        }
+      } else {
+        apiFallbackWarning = 'ElevenLabs API key missing — using Edge Neural fallback.';
+      }
+    }
+
+    // 0B. Google Gemini Native TTS Synthesis
+    if (requestedEngine === 'gemini' && requestedVoice) {
+      const allKeys = getApiKeys();
+      const targetKeyEntry =
+        (input?.keyId ? allKeys.find(k => k.id === input.keyId) : undefined) ||
+        allKeys.find(k => k.providerId === 'google');
+      const secret = targetKeyEntry ? await resolveKeySecretForRouter(targetKeyEntry).catch(() => null) : null;
+      if (secret) {
+        try {
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), 12000);
+          const resp = await fetch(
+            'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent',
+            {
+              method: 'POST',
+              headers: {
+                'x-goog-api-key': secret.trim(),
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                contents: [{ parts: [{ text: text.slice(0, 2500) }] }],
+                generationConfig: {
+                  responseModalities: ['AUDIO'],
+                  speechConfig: {
+                    voiceConfig: {
+                      prebuiltVoiceConfig: { voiceName: requestedVoice },
+                    },
+                  },
+                },
+              }),
+              signal: ctrl.signal,
+            }
+          ).finally(() => clearTimeout(timer));
+          if (resp.ok) {
+            const json: any = await resp.json().catch(() => null);
+            const inline = json?.candidates?.[0]?.content?.parts?.find((p: any) => p?.inlineData?.data)?.inlineData;
+            if (inline?.data) {
+              const rawMime = String(inline.mimeType || '').toLowerCase();
+              const rawBuf = Buffer.from(inline.data, 'base64');
+              const isWav = rawMime.includes('wav') || rawMime.includes('mpeg') || rawMime.includes('mp3');
+              const out = isWav
+                ? { audioBase64: inline.data, mimeType: inline.mimeType || 'audio/wav', source: 'gemini' }
+                : { audioBase64: wrapPcm24kToWavBase64(rawBuf), mimeType: 'audio/wav', source: 'gemini' };
+              if (cacheKey) setCachedTtsAudio(cacheKey, out);
+              return out;
+            }
+          } else {
+            apiFallbackWarning = `Gemini TTS (${resp.status}) unavailable — using Edge Neural fallback.`;
+          }
+        } catch {
+          apiFallbackWarning = 'Gemini TTS error — using Edge Neural fallback.';
+        }
+      }
+    }
+
+    // 0C. OpenAI TTS Synthesis
+    if (requestedEngine === 'openai' && requestedVoice) {
+      const allKeys = getApiKeys();
+      const targetKeyEntry =
+        (input?.keyId ? allKeys.find(k => k.id === input.keyId) : undefined) ||
+        allKeys.find(k => k.providerId === 'openai');
+      const secret = targetKeyEntry ? await resolveKeySecretForRouter(targetKeyEntry).catch(() => null) : null;
+      if (secret) {
+        try {
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), 9000);
+          const resp = await fetch('https://api.openai.com/v1/audio/speech', {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${secret.trim()}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              model: 'gpt-4o-mini-tts',
+              voice: requestedVoice,
+              input: text.slice(0, 2500),
+              response_format: 'mp3',
+            }),
+            signal: ctrl.signal,
+          }).finally(() => clearTimeout(timer));
+          if (resp.ok) {
+            const arrBuf = await resp.arrayBuffer();
+            const b64 = Buffer.from(arrBuf).toString('base64');
+            if (b64) {
+              const out = { audioBase64: b64, mimeType: 'audio/mpeg', source: 'openai' };
+              if (cacheKey) setCachedTtsAudio(cacheKey, out);
+              return out;
+            }
+          } else {
+            apiFallbackWarning = `OpenAI TTS (${resp.status}) unavailable — using Edge Neural fallback.`;
+          }
+        } catch {
+          apiFallbackWarning = 'OpenAI TTS error — using Edge Neural fallback.';
+        }
+      }
+    }
+
+    // 0D. Custom / OpenAI-Compatible TTS Model (e.g. Groq PlayAI/Orpheus, Together, Local/Gateway TTS)
+    if (requestedEngine === 'custom' && input?.modelId && input?.baseUrl) {
+      const allKeys = getApiKeys();
+      const targetKeyEntry = input?.keyId ? allKeys.find(k => k.id === input.keyId) : undefined;
+      const secret = targetKeyEntry ? await resolveKeySecretForRouter(targetKeyEntry).catch(() => null) : null;
+      if (secret) {
+        try {
+          const cleanBase = input.baseUrl.trim().replace(/\/+$/, '');
+          const speechUrl = cleanBase.endsWith('/v1') ? `${cleanBase}/audio/speech` : `${cleanBase}/v1/audio/speech`;
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), 9000);
+          const resp = await fetch(speechUrl, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${secret.trim()}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              model: input.modelId,
+              voice: requestedVoice || 'alloy',
+              input: text.slice(0, 2500),
+              response_format: 'wav',
+            }),
+            signal: ctrl.signal,
+          }).finally(() => clearTimeout(timer));
+          if (resp.ok) {
+            const arrBuf = await resp.arrayBuffer();
+            const b64 = Buffer.from(arrBuf).toString('base64');
+            const mime = resp.headers.get('content-type') || 'audio/wav';
+            if (b64) {
+              const out = { audioBase64: b64, mimeType: mime, source: 'custom' };
+              if (cacheKey) setCachedTtsAudio(cacheKey, out);
+              return out;
+            }
+          } else {
+            apiFallbackWarning = `API TTS (${resp.status}) unavailable — using Edge Neural fallback.`;
+          }
+        } catch {
+          apiFallbackWarning = 'API TTS error — using Edge Neural fallback.';
+        }
+      }
+    }
+
+    // 1. Primary / Fallback Microsoft Edge Neural Voice (msedge-tts)
+    if (requestedEngine !== 'system') {
+      const fallbackEdgeVoice = requestedVoice.includes('Neural') ? requestedVoice : 'en-US-AvaNeural';
+      const edgeResult = await runEdgeTtsSynthesis(text, fallbackEdgeVoice);
       if (edgeResult) {
-        if (cacheKey) setCachedTtsAudio(cacheKey, edgeResult);
-        return edgeResult;
+        if (cacheKey && !apiFallbackWarning) setCachedTtsAudio(cacheKey, edgeResult);
+        return apiFallbackWarning ? { ...edgeResult, warning: apiFallbackWarning } : edgeResult;
       }
     }
 
@@ -2524,6 +2935,10 @@ export function registerProviderHandlers(): void {
             : hasAccountCap
             ? gatewayTokenCap!
             : fallbackModelCap;
+          const bench = computeModelBenchmarks({
+            ...m,
+            providerId: resolvedType,
+          });
           return {
             ...m,
             keyId: entry.id,
@@ -2537,7 +2952,13 @@ export function registerProviderHandlers(): void {
             accountTokenCap: gatewayTokenCap,
             platformKey: hasPlatformCap ? prefix : undefined,
             tier: resolvedTier,
-            category: classifyModelCategory(m),
+            category: bench.category,
+            overallScore: bench.overallScore,
+            categoryScores: {
+              turbo: scoreModelForWorkflowCategory(bench.scores, bench.overallScore, 'turbo'),
+              standard: scoreModelForWorkflowCategory(bench.scores, bench.overallScore, 'standard'),
+              'deep-thought': scoreModelForWorkflowCategory(bench.scores, bench.overallScore, 'deep-thought'),
+            },
           };
         })
         .filter(Boolean);
@@ -2584,12 +3005,19 @@ export function registerProviderHandlers(): void {
       }
       return models.map(m => {
         const cap = m.contextWindow && m.contextWindow > 0 ? m.contextWindow : 128000;
+        const bench = computeModelBenchmarks({ ...m, providerId: resolvedType });
         return {
           ...m,
           tokensUsed: localUsage[m.id] ?? 0,
           tokenCap: cap,
           tier: m.tier || (resolvedType === 'ollama' || m.id.includes(':free') ? 'free' : 'paid'),
-          category: classifyModelCategory(m),
+          category: bench.category,
+          overallScore: bench.overallScore,
+          categoryScores: {
+            turbo: scoreModelForWorkflowCategory(bench.scores, bench.overallScore, 'turbo'),
+            standard: scoreModelForWorkflowCategory(bench.scores, bench.overallScore, 'standard'),
+            'deep-thought': scoreModelForWorkflowCategory(bench.scores, bench.overallScore, 'deep-thought'),
+          },
         };
       });
     } catch {
@@ -2859,18 +3287,26 @@ export function registerApiKeyHandlers(): void {
         valid = resp.ok;
         if (!valid) errorMsg = `Anthropic API rejected key (Status ${resp.status})`;
       } else if (resolvedType === 'openrouter' || resolvedType === 'custom') {
-        const configured = providerManager.getProviderForKeyProfile(resolvedType, key);
-        const rawBase = profile.baseUrl || configured?.getProvider().config?.baseUrl || '';
-        if (!rawBase) {
-          valid = true;
-        } else {
-          const clean = rawBase.trim().replace(/\/+$/, '');
-          const modelsUrl = clean.endsWith('/v1') ? `${clean}/models` : `${clean}/v1/models`;
-          const resp = await fetch(modelsUrl, {
-            headers: { Authorization: `Bearer ${key}` },
+        if (profile.baseUrl?.includes('elevenlabs.io')) {
+          const resp = await fetch('https://api.elevenlabs.io/v1/user', {
+            headers: { 'xi-api-key': key },
           });
           valid = resp.ok;
-          if (!valid) errorMsg = `Endpoint rejected key (Status ${resp.status})`;
+          if (!valid) errorMsg = `ElevenLabs API rejected key (Status ${resp.status})`;
+        } else {
+          const configured = providerManager.getProviderForKeyProfile(resolvedType, key);
+          const rawBase = profile.baseUrl || configured?.getProvider().config?.baseUrl || '';
+          if (!rawBase) {
+            valid = true;
+          } else {
+            const clean = rawBase.trim().replace(/\/+$/, '');
+            const modelsUrl = clean.endsWith('/v1') ? `${clean}/models` : `${clean}/v1/models`;
+            const resp = await fetch(modelsUrl, {
+              headers: { Authorization: `Bearer ${key}` },
+            });
+            valid = resp.ok;
+            if (!valid) errorMsg = `Endpoint rejected key (Status ${resp.status})`;
+          }
         }
       } else {
         valid = true;
@@ -2932,7 +3368,7 @@ export function registerWorkspaceHandlers(): void {
   });
 
   ipcMain.handle(IPC_CHANNELS.WORKSPACE_LIST_RECENT, async () => {
-    return getWorkspaces();
+    return getWorkspaces().filter(w => Boolean(w?.path && fsSync.existsSync(w.path)));
   });
 
   ipcMain.handle(IPC_CHANNELS.WORKSPACE_OPEN, async (_event, workspaceIdOrPath) => {
@@ -2972,7 +3408,22 @@ export function registerWorkspaceHandlers(): void {
   });
 
   ipcMain.handle('workspace:list-projects', async () => {
-    return getSetting('work:projects', []);
+    const raw = getSetting<any[]>('work:projects', []);
+    if (!Array.isArray(raw)) return [];
+    let changed = false;
+    const pruned = raw.map(proj => {
+      if (!proj || !Array.isArray(proj.folders)) return proj;
+      const existingFolders = proj.folders.filter((f: any) => f?.path && fsSync.existsSync(f.path));
+      if (existingFolders.length !== proj.folders.length) {
+        changed = true;
+        return { ...proj, folders: existingFolders };
+      }
+      return proj;
+    });
+    if (changed) {
+      setSetting('work:projects', pruned);
+    }
+    return pruned;
   });
 
   ipcMain.handle('workspace:save-projects', async (_event, projects: any[]) => {
@@ -3106,20 +3557,37 @@ export function registerFileSystemHandlers(): void {
     }
   });
 
+  ipcMain.handle('fs:exists', async (_event, targetPath: string) => {
+    if (!targetPath || !validateWorkspaceAccess(targetPath)) {
+      return { exists: false, isDirectory: false };
+    }
+    try {
+      const stats = await fs.stat(targetPath);
+      return { exists: true, isDirectory: stats.isDirectory() };
+    } catch {
+      return { exists: false, isDirectory: false };
+    }
+  });
+
   ipcMain.handle(IPC_CHANNELS.FS_DELETE, async (_event, targetPath) => {
     if (!validateWorkspaceAccess(targetPath)) {
       throw new Error('Access denied: path outside workspace');
     }
 
     try {
-      const stats = await fs.stat(targetPath);
-      if (stats.isDirectory()) {
-        await fs.rm(targetPath, { recursive: true });
+      const resolved = path.resolve(targetPath);
+      if (typeof shell?.trashItem === 'function') {
+        await shell.trashItem(resolved);
       } else {
-        await fs.unlink(targetPath);
+        const stats = await fs.stat(resolved);
+        if (stats.isDirectory()) {
+          await fs.rm(resolved, { recursive: true });
+        } else {
+          await fs.unlink(resolved);
+        }
       }
     } catch (error) {
-      throw new Error(`Failed to delete: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to move to Recycle Bin: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   });
 

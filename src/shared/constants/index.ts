@@ -8,7 +8,7 @@
 // ============================================================================
 
 export const APP_NAME = 'EXCO';
-export const APP_VERSION = '0.1.0';
+export const APP_VERSION = '0.1.2';
 export const APP_DESCRIPTION = 'Autonomous Engineering Intelligence Platform';
 export const APP_AUTHOR = 'EXCO Team';
 export const APP_COPYRIGHT = 'Copyright © 2026 EXCO Team';

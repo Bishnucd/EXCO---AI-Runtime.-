@@ -374,7 +374,10 @@ export function ConfigToolDrawer({ activeTool, onClose }: ConfigToolDrawerProps)
   const [hoveredTokenPos, setHoveredTokenPos] = useState<{ left: number; top: number } | null>(null);
   const [expandedTierGroups, setExpandedTierGroups] = useState<Record<string, boolean>>({});
   const [expandedUseGroups, setExpandedUseGroups] = useState<Record<string, boolean>>({});
-  const [preferredModelId, setPreferredModelId] = useState<string>(() => localStorage.getItem('exco:chat:preferred-model') || 'auto');
+  const [preferredModelId, setPreferredModelId] = useState<string>(() => {
+    const saved = localStorage.getItem('exco:chat:preferred-model');
+    return saved && saved !== 'auto' && saved !== 'default' ? saved : 'category-best';
+  });
 
   const syncOverviewBenchmarks = useCallback(async (forceFetch = false) => {
     setLoadingOverview(true);
@@ -1137,9 +1140,9 @@ export function ConfigToolDrawer({ activeTool, onClose }: ConfigToolDrawerProps)
     }
   };
 
-  const selectBestModel = (model: EvaluatedSystemModel, workflowTarget: 'auto' | 'turbo' | 'standard' | 'deep-thought') => {
+  const selectBestModel = (model: EvaluatedSystemModel, workflowTarget: 'turbo' | 'standard' | 'deep-thought') => {
     localStorage.setItem('exco:chat:preferred-model', model.id);
-    localStorage.setItem('exco:chat:workflow-mode', workflowTarget);
+    sessionStorage.setItem('exco:chat:workflow-mode', workflowTarget);
     setPreferredModelId(model.id);
     window.dispatchEvent(
       new CustomEvent('exco:model-preference-updated', {
@@ -1520,7 +1523,7 @@ export function ConfigToolDrawer({ activeTool, onClose }: ConfigToolDrawerProps)
               </div>
               <div className="p-3 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-2.5">
                 {[
-                  { title: 'Best for Chat', model: bestChat, scoreLabel: bestChat ? `Chat ${bestChat.scores.chat}/100` : '', workflow: 'auto' as const },
+                  { title: 'Best for Chat', model: bestChat, scoreLabel: bestChat ? `Chat ${bestChat.scores.chat}/100` : '', workflow: (bestChat?.category || 'standard') as 'turbo' | 'standard' | 'deep-thought' },
                   { title: 'Best for Research', model: bestResearch, scoreLabel: bestResearch ? `Research ${bestResearch.scores.reasoning}/100` : '', workflow: 'deep-thought' as const },
                   { title: 'Best for Coding', model: bestCoding, scoreLabel: bestCoding ? `Coding ${bestCoding.scores.coding}/100` : '', workflow: 'deep-thought' as const },
                   { title: 'Best for Image Creation', model: bestImage, scoreLabel: bestImage ? `Image ${bestImage.scores.imageGen}/100` : '', workflow: 'standard' as const },

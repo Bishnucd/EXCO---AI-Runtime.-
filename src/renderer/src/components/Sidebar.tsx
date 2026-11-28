@@ -77,6 +77,7 @@ export function Sidebar({
     createFileInDir,
     createFolderInDir,
     renameFsEntry,
+    deleteFsEntry,
   } = useWorkspaceStore();
   const sidebarSegment = useThemeStore(state => state.segments.sidebar);
   const globalFilter = useThemeStore(state => state.globalFilter);
@@ -93,6 +94,29 @@ export function Sidebar({
   const [newEntryName, setNewEntryName] = useState('');
   const [renamingFsPath, setRenamingFsPath] = useState<string | null>(null);
   const [renameFsValue, setRenameFsValue] = useState('');
+  const [pendingDeleteFsEntry, setPendingDeleteFsEntry] = useState<{
+    path: string;
+    name: string;
+    type: 'file' | 'folder';
+  } | null>(null);
+  const [selectedFsItems, setSelectedFsItems] = useState<Record<string, { path: string; name: string; type: 'file' | 'folder' }>>({});
+  const [pendingDeleteFsBatch, setPendingDeleteFsBatch] = useState<Array<{ path: string; name: string; type: 'file' | 'folder' }> | null>(null);
+  const [deletingFsEntry, setDeletingFsEntry] = useState(false);
+
+  const toggleFsItemSelected = (item: { path: string; name: string; type: 'file' | 'folder' }, e: React.MouseEvent | React.ChangeEvent) => {
+    e.stopPropagation();
+    setSelectedFsItems(prev => {
+      const next = { ...prev };
+      if (next[item.path]) {
+        delete next[item.path];
+      } else {
+        next[item.path] = item;
+      }
+      return next;
+    });
+  };
+  const selectedFsList = Object.values(selectedFsItems);
+  const hasSelectedFsItems = selectedFsList.length > 0;
   const [explorerOpError, setExplorerOpError] = useState<string | null>(null);
 
   const isChatActive = location.pathname.startsWith('/chat') || location.pathname === '/';
@@ -531,15 +555,30 @@ export function Sidebar({
           }
 
           if (node.type === 'directory') {
+            const isChecked = Boolean(selectedFsItems[node.path]);
             return (
               <div key={node.path}>
                 <div
                   className={cn(
                     'group flex items-center gap-1 rounded-md pr-1 transition-colors',
                     'hover:bg-[rgb(var(--color-surface-hover))]',
-                    isSelected && 'bg-[rgb(var(--color-primary-light))] text-[rgb(var(--color-accent-ink))] font-semibold'
+                    isChecked && 'bg-amber-500/10 ring-1 ring-amber-500/30',
+                    isSelected && !isChecked && 'bg-[rgb(var(--color-primary-light))] text-[rgb(var(--color-accent-ink))] font-semibold'
                   )}
                 >
+                  {!collapsed && (
+                    <input
+                      type="checkbox"
+                      checked={isChecked}
+                      onChange={e => toggleFsItemSelected({ path: node.path, name: node.name, type: 'folder' }, e)}
+                      onClick={e => e.stopPropagation()}
+                      className={cn(
+                        'ml-1.5 w-3.5 h-3.5 rounded accent-amber-500 cursor-pointer flex-shrink-0 transition-opacity p-0',
+                        hasSelectedFsItems || isChecked ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                      )}
+                      title={`Select ${node.name}`}
+                    />
+                  )}
                   <button
                     type="button"
                     onClick={() => togglePath(node.path)}
@@ -591,6 +630,18 @@ export function Sidebar({
                       >
                         <Edit2 className="w-3 h-3" />
                       </button>
+                      <button
+                        type="button"
+                        onClick={e => {
+                          e.stopPropagation();
+                          setExplorerOpError(null);
+                          setPendingDeleteFsEntry({ path: node.path, name: node.name, type: 'folder' });
+                        }}
+                        className="p-0.5 rounded hover:bg-red-500/10 text-slate-500 hover:text-red-500 transition-colors"
+                        title="Delete Folder (Moves to Recycle Bin)"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
                     </div>
                   )}
                 </div>
@@ -611,15 +662,30 @@ export function Sidebar({
             );
           } else {
             const IconComp = getFileIcon(node.extension);
+            const isChecked = Boolean(selectedFsItems[node.path]);
             return (
               <div
                 key={node.path}
                 className={cn(
                   'group flex items-center gap-1 rounded-md pr-1 transition-colors',
                   'hover:bg-[rgb(var(--color-surface-hover))]',
-                  isSelected && 'bg-[rgb(var(--color-primary-light))] text-[rgb(var(--color-accent-ink))] font-semibold'
+                  isChecked && 'bg-amber-500/10 ring-1 ring-amber-500/30',
+                  isSelected && !isChecked && 'bg-[rgb(var(--color-primary-light))] text-[rgb(var(--color-accent-ink))] font-semibold'
                 )}
               >
+                {!collapsed && (
+                  <input
+                    type="checkbox"
+                    checked={isChecked}
+                    onChange={e => toggleFsItemSelected({ path: node.path, name: node.name, type: 'file' }, e)}
+                    onClick={e => e.stopPropagation()}
+                    className={cn(
+                      'ml-1.5 w-3.5 h-3.5 rounded accent-amber-500 cursor-pointer flex-shrink-0 transition-opacity p-0',
+                      hasSelectedFsItems || isChecked ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                    )}
+                    title={`Select ${node.name}`}
+                  />
+                )}
                 <button
                   type="button"
                   onClick={() => selectFile(node)}
@@ -648,6 +714,18 @@ export function Sidebar({
                     >
                       <Edit2 className="w-3 h-3" />
                     </button>
+                    <button
+                      type="button"
+                      onClick={e => {
+                        e.stopPropagation();
+                        setExplorerOpError(null);
+                        setPendingDeleteFsEntry({ path: node.path, name: node.name, type: 'file' });
+                      }}
+                      className="p-0.5 rounded hover:bg-red-500/10 text-slate-500 hover:text-red-500 transition-colors"
+                      title="Delete File (Moves to Recycle Bin)"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                    </button>
                   </div>
                 )}
               </div>
@@ -674,6 +752,33 @@ export function Sidebar({
           <Plus className="w-4 h-4 flex-shrink-0" />
           {!collapsed && <span>New Project</span>}
         </button>
+
+        {/* Bulk Multi-Select Delete Bar */}
+        {!collapsed && hasSelectedFsItems && (
+          <div className="flex items-center justify-between gap-1.5 px-2.5 py-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 text-xs flex-shrink-0">
+            <span className="font-semibold text-amber-300 truncate">
+              {selectedFsList.length} selected
+            </span>
+            <div className="flex items-center gap-1 flex-shrink-0">
+              <button
+                type="button"
+                onClick={() => setPendingDeleteFsBatch(selectedFsList)}
+                className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-red-600 hover:bg-red-500 text-white text-[11px] font-semibold"
+                title="Move all selected files/folders to Recycle Bin"
+              >
+                <Trash2 className="w-3 h-3" />
+                <span>Delete</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelectedFsItems({})}
+                className="px-1.5 py-0.5 rounded border border-[rgb(var(--color-border))] text-[11px] text-[rgb(var(--color-foreground-muted))] hover:text-[rgb(var(--color-foreground))]"
+              >
+                Clear
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Collapsible Saved Projects Tree List (Project -> Folders -> Subfolders -> Files) */}
         {!collapsed ? (
@@ -913,7 +1018,21 @@ export function Sidebar({
                             const nodes = fileTrees[folder.path] || [];
                             return (
                               <div key={folder.path} className="space-y-0.5">
-                                <div className="group flex items-center gap-1 rounded-md bg-[rgb(var(--color-primary-light))]/30 hover:bg-[rgb(var(--color-surface-hover))] pr-1 transition-colors">
+                                <div className={cn(
+                                  'group flex items-center gap-1 rounded-md bg-[rgb(var(--color-primary-light))]/30 hover:bg-[rgb(var(--color-surface-hover))] pr-1 transition-colors',
+                                  selectedFsItems[folder.path] && 'ring-1 ring-amber-500/40 bg-amber-500/10'
+                                )}>
+                                  <input
+                                    type="checkbox"
+                                    checked={Boolean(selectedFsItems[folder.path])}
+                                    onChange={e => toggleFsItemSelected({ path: folder.path, name: folder.name, type: 'folder' }, e)}
+                                    onClick={e => e.stopPropagation()}
+                                    className={cn(
+                                      'ml-1.5 w-3.5 h-3.5 rounded accent-amber-500 cursor-pointer flex-shrink-0 transition-opacity p-0',
+                                      hasSelectedFsItems || selectedFsItems[folder.path] ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                                    )}
+                                    title={`Select ${folder.name}`}
+                                  />
                                   <button
                                     type="button"
                                     onClick={() => togglePath(folder.path)}
@@ -948,6 +1067,18 @@ export function Sidebar({
                                       title="New Subfolder"
                                     >
                                       <FolderPlus className="w-3 h-3" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={e => {
+                                        e.stopPropagation();
+                                        setExplorerOpError(null);
+                                        setPendingDeleteFsEntry({ path: folder.path, name: folder.name, type: 'folder' });
+                                      }}
+                                      className="p-0.5 rounded hover:bg-red-500/10 text-slate-500 hover:text-red-500 transition-colors"
+                                      title="Delete Folder (Moves to Recycle Bin)"
+                                    >
+                                      <Trash2 className="w-3 h-3" />
                                     </button>
                                   </div>
                                 </div>
@@ -1219,6 +1350,133 @@ export function Sidebar({
             </div>
           </div>
         )}
+
+      {/* Workspace File / Folder Recycle Bin Confirmation Modal */}
+      {pendingDeleteFsEntry && (
+        <div
+          className="fixed inset-0 z-[500] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => !deletingFsEntry && setPendingDeleteFsEntry(null)}
+        >
+          <div
+            className="w-full max-w-sm rounded-xl border border-amber-500/40 bg-[rgb(var(--color-surface))] p-5 shadow-2xl animate-scale-in"
+            onClick={e => e.stopPropagation()}
+          >
+            <h3 className="text-base font-semibold text-[rgb(var(--color-foreground))] mb-2">
+              Delete {pendingDeleteFsEntry.type === 'folder' ? 'Folder' : 'File'}?
+            </h3>
+            <p className="text-xs leading-relaxed text-[rgb(var(--color-foreground-muted))] mb-4">
+              Deleting <span className="font-semibold text-[rgb(var(--color-foreground))]">&ldquo;{pendingDeleteFsEntry.name}&rdquo;</span> will delete it from both EXCO and its folder on your computer, and move it to your{' '}
+              <span className="text-amber-400 font-semibold">Recycle Bin</span> so you can restore it if needed.
+            </p>
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                disabled={deletingFsEntry}
+                onClick={() => setPendingDeleteFsEntry(null)}
+                className="px-3.5 py-1.5 rounded-lg border border-[rgb(var(--color-border))] text-xs font-medium text-[rgb(var(--color-foreground))] hover:bg-[rgb(var(--color-surface-hover))] disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={deletingFsEntry}
+                onClick={async () => {
+                  const target = pendingDeleteFsEntry;
+                  if (!target) return;
+                  setDeletingFsEntry(true);
+                  try {
+                    setExplorerOpError(null);
+                    await deleteFsEntry(target.path);
+                    setPendingDeleteFsEntry(null);
+                  } catch (err: any) {
+                    setExplorerOpError(err?.message || 'Failed to move item to Recycle Bin');
+                    setPendingDeleteFsEntry(null);
+                  } finally {
+                    setDeletingFsEntry(false);
+                  }
+                }}
+                className="px-3.5 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white text-xs font-semibold shadow-sm disabled:opacity-50"
+              >
+                {deletingFsEntry ? 'Deleting...' : 'Delete to Recycle Bin'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Batch Multi-Select Recycle Bin Confirmation Modal */}
+      {pendingDeleteFsBatch && pendingDeleteFsBatch.length > 0 && (
+        <div
+          className="fixed inset-0 z-[500] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => !deletingFsEntry && setPendingDeleteFsBatch(null)}
+        >
+          <div
+            className="w-full max-w-sm rounded-xl border border-amber-500/40 bg-[rgb(var(--color-surface))] p-5 shadow-2xl animate-scale-in"
+            onClick={e => e.stopPropagation()}
+          >
+            <h3 className="text-base font-semibold text-[rgb(var(--color-foreground))] mb-2">
+              Delete {pendingDeleteFsBatch.length} Selected {pendingDeleteFsBatch.length === 1 ? 'Item' : 'Items'}?
+            </h3>
+            <p className="text-xs leading-relaxed text-[rgb(var(--color-foreground-muted))] mb-2">
+              Deleting these items will remove them from both EXCO and their folders on your computer, and move them to your{' '}
+              <span className="text-amber-400 font-semibold">Recycle Bin</span> so you can restore them anytime.
+            </p>
+            <div className="max-h-28 overflow-y-auto mb-4 px-2.5 py-1.5 rounded-lg bg-[rgb(var(--color-background))] border border-[rgb(var(--color-border))] text-[11px] font-mono space-y-0.5">
+              {pendingDeleteFsBatch.map(item => (
+                <div key={item.path} className="truncate text-[rgb(var(--color-foreground))]">
+                  {item.type === 'folder' ? '📁 ' : '📄 '}
+                  {item.name}
+                </div>
+              ))}
+            </div>
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                disabled={deletingFsEntry}
+                onClick={() => setPendingDeleteFsBatch(null)}
+                className="px-3.5 py-1.5 rounded-lg border border-[rgb(var(--color-border))] text-xs font-medium text-[rgb(var(--color-foreground))] hover:bg-[rgb(var(--color-surface-hover))] disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={deletingFsEntry}
+                onClick={async () => {
+                  const batch = pendingDeleteFsBatch;
+                  if (!batch?.length) return;
+                  setDeletingFsEntry(true);
+                  try {
+                    setExplorerOpError(null);
+                    const sorted = [...batch].sort((a, b) => a.path.length - b.path.length);
+                    const rootsToDelete: typeof sorted = [];
+                    for (const item of sorted) {
+                      const normItem = item.path.replace(/\\/g, '/').toLowerCase();
+                      const coveredByParent = rootsToDelete.some(parent => {
+                        const normParent = parent.path.replace(/\\/g, '/').toLowerCase().replace(/\/$/, '');
+                        return normItem === normParent || normItem.startsWith(normParent + '/');
+                      });
+                      if (!coveredByParent) rootsToDelete.push(item);
+                    }
+                    for (const item of rootsToDelete) {
+                      await deleteFsEntry(item.path);
+                    }
+                    setSelectedFsItems({});
+                    setPendingDeleteFsBatch(null);
+                  } catch (err: any) {
+                    setExplorerOpError(err?.message || 'Failed to delete selected items to Recycle Bin');
+                    setPendingDeleteFsBatch(null);
+                  } finally {
+                    setDeletingFsEntry(false);
+                  }
+                }}
+                className="px-3.5 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white text-xs font-semibold shadow-sm disabled:opacity-50"
+              >
+                {deletingFsEntry ? 'Deleting...' : `Move ${pendingDeleteFsBatch.length} to Recycle Bin`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </aside>
   );
 }

@@ -8,9 +8,23 @@ import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import edgeVoicePreviews from '../assets/edgeVoicePreviews.json';
 
-export type VoiceOutputModule = 'edge-neural' | 'system';
+export type VoiceOutputModule = 'edge-neural' | 'elevenlabs' | 'gemini' | 'openai' | 'custom' | 'system';
 export type SpeechRecognitionEngine = 'auto' | 'gemini' | 'openai-whisper' | 'windows-speech';
 export type MicSensitivity = 'low' | 'medium' | 'high';
+
+export interface ApiVoiceOption {
+  id: string;
+  engine: 'elevenlabs' | 'gemini' | 'openai' | 'custom';
+  keyId: string;
+  keyName: string;
+  voiceId: string;
+  modelId?: string;
+  baseUrl?: string;
+  name: string;
+  category?: string;
+  description?: string;
+  previewUrl?: string;
+}
 
 /** Single uniform single-sentence preview read by every voice module for instant side-by-side comparison. */
 export const VOICE_PREVIEW_SENTENCE = 'Hello, I am ready for live voice chat.';
@@ -52,6 +66,12 @@ export interface VoiceSettingsState {
   voiceModule: VoiceOutputModule;
   selectedPresetId: string;
   edgeVoice: string;
+  apiVoiceId: string;
+  apiVoiceModelId: string;
+  apiVoiceBaseUrl: string;
+  apiVoiceKeyId: string;
+  apiVoiceName: string;
+  apiVoicePreviewUrl: string;
   systemVoiceURI: string;
   speechEngine: SpeechRecognitionEngine;
   speechLanguage: string;
@@ -60,8 +80,9 @@ export interface VoiceSettingsState {
   micSensitivity: MicSensitivity;
   silenceDelayMs: number;
   pauseMicWhileSpeaking: boolean;
-  setVoiceSettings: (patch: Partial<Omit<VoiceSettingsState, 'setVoiceSettings' | 'applyPreset' | 'resetVoiceSettings'>>) => void;
+  setVoiceSettings: (patch: Partial<Omit<VoiceSettingsState, 'setVoiceSettings' | 'applyPreset' | 'applyApiVoice' | 'resetVoiceSettings'>>) => void;
   applyPreset: (presetId: string) => void;
+  applyApiVoice: (voice: ApiVoiceOption) => void;
   resetVoiceSettings: () => void;
 }
 
@@ -69,6 +90,12 @@ const DEFAULT_VOICE_SETTINGS = {
   voiceModule: 'edge-neural' as VoiceOutputModule,
   selectedPresetId: 'edge-ava',
   edgeVoice: 'en-US-AvaNeural',
+  apiVoiceId: '',
+  apiVoiceModelId: '',
+  apiVoiceBaseUrl: '',
+  apiVoiceKeyId: '',
+  apiVoiceName: '',
+  apiVoicePreviewUrl: '',
   systemVoiceURI: '',
   speechEngine: 'auto' as SpeechRecognitionEngine,
   speechLanguage: 'en',
@@ -91,7 +118,26 @@ export const useVoiceSettingsStore = create<VoiceSettingsState>()(
           selectedPresetId: preset.id,
           voiceModule: preset.module,
           edgeVoice: preset.edgeVoice,
+          apiVoiceId: '',
+          apiVoiceModelId: '',
+          apiVoiceBaseUrl: '',
+          apiVoiceKeyId: '',
+          apiVoiceName: '',
+          apiVoicePreviewUrl: '',
           ...(preset.pitch !== undefined ? { voicePitch: preset.pitch } : {}),
+        }));
+      },
+      applyApiVoice: (voice) => {
+        set((state) => ({
+          ...state,
+          selectedPresetId: voice.id,
+          voiceModule: voice.engine,
+          apiVoiceId: voice.voiceId,
+          apiVoiceModelId: voice.modelId || '',
+          apiVoiceBaseUrl: voice.baseUrl || '',
+          apiVoiceKeyId: voice.keyId,
+          apiVoiceName: voice.name,
+          apiVoicePreviewUrl: voice.previewUrl || '',
         }));
       },
       resetVoiceSettings: () => set({ ...DEFAULT_VOICE_SETTINGS }),
@@ -117,10 +163,13 @@ export function getVadThresholdForSensitivity(sensitivity: MicSensitivity): numb
 }
 
 export function resolveVoiceForModule(
-  settings: Pick<VoiceSettingsState, 'voiceModule' | 'edgeVoice' | 'systemVoiceURI'>
+  settings: Pick<VoiceSettingsState, 'voiceModule' | 'edgeVoice' | 'systemVoiceURI' | 'apiVoiceId'>
 ): string {
   if (settings.voiceModule === 'system') {
     return settings.systemVoiceURI || '';
+  }
+  if (settings.voiceModule === 'elevenlabs' || settings.voiceModule === 'gemini' || settings.voiceModule === 'openai' || settings.voiceModule === 'custom') {
+    return settings.apiVoiceId || '';
   }
   return settings.edgeVoice || 'en-US-AvaNeural';
 }
@@ -205,6 +254,52 @@ export function playExclusiveAudioBase64(
 
     const activeToken = expectedToken ?? globalAudioSessionToken;
     const audio = new Audio(`data:${mimeType || 'audio/mpeg'};base64,${audioBase64}`);
+    audio.preservesPitch = true;
+    audio.playbackRate = speed || 1.0;
+    audio.volume = 1.0;
+    globalActiveAudio = audio;
+
+    audio.onended = () => {
+      if (globalActiveAudio === audio) globalActiveAudio = null;
+      resolve(activeToken === globalAudioSessionToken ? 'played' : 'aborted');
+    };
+    audio.onerror = () => {
+      if (globalActiveAudio === audio) globalActiveAudio = null;
+      resolve('error');
+    };
+    audio.play().catch(() => {
+      if (globalActiveAudio === audio) globalActiveAudio = null;
+      resolve('error');
+    });
+  });
+}
+
+export function playExclusiveAudioUrl(
+  url: string,
+  speed: number,
+  expectedToken?: number
+): Promise<'played' | 'aborted' | 'error'> {
+  return new Promise((resolve) => {
+    if (!url || (expectedToken !== undefined && expectedToken !== globalAudioSessionToken)) {
+      resolve('aborted');
+      return;
+    }
+
+    if (globalActiveAudio) {
+      try {
+        globalActiveAudio.onended = null;
+        globalActiveAudio.onerror = null;
+        globalActiveAudio.pause();
+        globalActiveAudio.src = '';
+      } catch {}
+      globalActiveAudio = null;
+    }
+    try {
+      window.speechSynthesis?.cancel();
+    } catch {}
+
+    const activeToken = expectedToken ?? globalAudioSessionToken;
+    const audio = new Audio(url);
     audio.preservesPitch = true;
     audio.playbackRate = speed || 1.0;
     audio.volume = 1.0;

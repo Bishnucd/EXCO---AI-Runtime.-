@@ -1,14 +1,22 @@
 /**
- * EXCO Overviewer & Keyword-Triggered Model Router
+ * EXCO Overview-Scored Category Model Router
  *
- * - Zero prompt/route caching.
- * - Default messages (no trigger keyword in prompt) go straight to a single fast default model.
- * - When a specific workflow keyword is present in the prompt (e.g., research, documentation,
- *   coding, fast/turbo), the Overviewer selects the best model for that workflow across all
- *   connected API keys and fails over automatically on token/quota exhaustion.
+ * - Strictly honors the user's manually selected workflow category ('turbo' | 'standard' | 'deep-thought').
+ * - Zero prompt-keyword auto-switching between categories.
+ * - Uses the unified 0-100 Overview benchmark scores to rank models within the selected category.
+ * - When a model's token/quota limit runs out on one API key, automatically fails over to the
+ *   SAME model on other configured API keys first before moving to the next-best model in category.
  */
 
-import { classifyModelCategory, inferModelTier, inferProviderFromApiKey, resolveApiKeyProfile, type ModelCategory, type WorkflowSelection } from '@shared/utils';
+import {
+  computeModelBenchmarks,
+  inferModelTier,
+  inferProviderFromApiKey,
+  resolveApiKeyProfile,
+  scoreModelForWorkflowCategory,
+  type ModelCategory,
+  type WorkflowSelection,
+} from '@shared/utils';
 import type { ApiKeyEntry, AIProvider, Message } from '@shared/types';
 import { getProviders, updateProvider } from '@main/database';
 import { providerManager } from '@main/services/ai-providers';
@@ -25,6 +33,10 @@ export interface RoutedCandidate {
   modelName: string;
   category: ModelCategory;
   tier: 'free' | 'paid';
+  overallScore: number;
+  turboScore: number;
+  standardScore: number;
+  deepThoughtScore: number;
   speedScore: number;
   researchScore: number;
   documentationScore: number;
@@ -52,13 +64,11 @@ export interface OverviewerDecision {
 }
 
 const EXHAUSTED_COOLDOWN_MS = 10 * 60 * 1000;
-const OVERVIEWER_TIMEOUT_MS = 450;
 const DISCOVERY_TIMEOUT_MS = 1100;
 const CANDIDATE_POOL_TTL_MS = 60 * 1000;
 
 const exhaustedUntil = new Map<string, { until: number; reason: string }>();
 const exhaustedKeysUntil = new Map<string, { until: number; reason: string }>();
-let activeOverviewerKey: string | null = null;
 let cachedPoolEntry: { keysSig: string; fetchedAt: number; candidates: RoutedCandidate[] } | null = null;
 let inFlightPoolPromise: Promise<RoutedCandidate[]> | null = null;
 
@@ -73,7 +83,6 @@ export function invalidateCandidatePoolCache(): void {
 export function clearRouterStateForTests(): void {
   exhaustedUntil.clear();
   exhaustedKeysUntil.clear();
-  activeOverviewerKey = null;
   cachedPoolEntry = null;
   inFlightPoolPromise = null;
 }
@@ -106,9 +115,6 @@ export function markModelExhausted(keyId: string, modelId: string, reason = 'quo
   exhaustedUntil.set(k, { until: Date.now() + EXHAUSTED_COOLDOWN_MS, reason });
   if (isAuthError(reason)) {
     markKeyAuthFailed(keyId || 'default', reason);
-  }
-  if (activeOverviewerKey === k) {
-    activeOverviewerKey = null;
   }
 }
 
@@ -312,79 +318,72 @@ export function computeTaskScores(params: {
   return { speedScore, researchScore, documentationScore, codingScore };
 }
 
-/**
- * Checks whether the prompt contains an explicit trigger keyword requiring Overviewer
- * workflow selection. Returns null for regular conversational turns with no trigger word.
- */
-export function detectKeywordTrigger(params: {
-  promptText: string;
-  hasHeavyAttachments?: boolean;
-  workflowMode?: WorkflowSelection;
-  reasoningEffort?: string;
-}): { taskType: RoutingTaskType; keyword: string } | null {
-  const { promptText, hasHeavyAttachments, workflowMode, reasoningEffort } = params;
-  const trimmed = (promptText || '').trim();
-  const lower = trimmed.toLowerCase();
-
-  if (workflowMode === 'turbo') return { taskType: 'fast-chat', keyword: 'workflow:turbo' };
-  if (workflowMode === 'deep-thought' || reasoningEffort === 'high') {
-    return { taskType: 'higher-research', keyword: 'workflow:deep-thought' };
-  }
-  if (workflowMode === 'standard') return { taskType: 'documentation', keyword: 'workflow:standard' };
-
-  const docMatch = lower.match(
-    /\b(documentation|document|readme|prd|spec|specification|technical guide|user guide|onboarding guide|manual|changelog|release notes|summarize|summary|report|whitepaper|proposal|write docs|api docs|@docs|#docs)\b/i
-  );
-  const researchMatch = lower.match(
-    /\b(research|investigate|deep dive|architect|architecture|system design|analyze deeply|trade[- ]?offs|strategy|benchmark|security audit|mathematical proof|hypothesis|literature|root cause|synthesize|step[- ]by[- ]step reasoning|@research|#research)\b/i
-  );
-  const codeMatch =
-    trimmed.includes('```')
-      ? ['```']
-      : lower.match(
-          /\b(code|coding|debug|refactor|implement|typescript|javascript|python|rust|golang|sql|unit test|stack trace|@code|#code)\b/i
-        );
-  const fastMatch = lower.match(/\b(quick|fast|turbo|tldr|briefly|@fast|#fast)\b/i);
-
-  if (docMatch && !researchMatch) {
-    return { taskType: 'documentation', keyword: docMatch[0] };
-  }
-  if (researchMatch || hasHeavyAttachments) {
-    return { taskType: 'higher-research', keyword: researchMatch?.[0] || 'heavy-attachment' };
-  }
-  if (codeMatch) {
-    return { taskType: 'coding', keyword: codeMatch[0] };
-  }
-  if (fastMatch) {
-    return { taskType: 'fast-chat', keyword: fastMatch[0] };
-  }
-
-  return null;
-}
-
-export function classifyTaskHeuristic(params: {
-  promptText: string;
-  hasHeavyAttachments?: boolean;
-  hasAnyAttachment?: boolean;
-  workflowMode?: WorkflowSelection;
-  reasoningEffort?: string;
-}): RoutingTaskType {
-  const triggered = detectKeywordTrigger(params);
-  if (triggered) return triggered.taskType;
-  return 'fast-chat';
-}
-
-export function mapTaskTypeToCategory(taskType: RoutingTaskType): ModelCategory {
-  switch (taskType) {
-    case 'higher-research':
-      return 'deep-thought';
-    case 'documentation':
-    case 'coding':
-      return 'standard';
-    case 'fast-chat':
+export function mapCategoryToTaskType(category: ModelCategory): RoutingTaskType {
+  switch (category) {
+    case 'deep-thought':
+      return 'higher-research';
+    case 'standard':
+      return 'documentation';
+    case 'turbo':
     default:
-      return 'turbo';
+      return 'fast-chat';
   }
+}
+
+export function getCandidateCategoryScore(candidate: RoutedCandidate, category: ModelCategory): number {
+  switch (category) {
+    case 'turbo':
+      return candidate.turboScore;
+    case 'deep-thought':
+      return candidate.deepThoughtScore;
+    case 'standard':
+    default:
+      return candidate.standardScore;
+  }
+}
+
+/**
+ * Orders candidates strictly by best model first (Quality Tier -> Overview category score -> overall score),
+ * keeping ALL non-exhausted API keys for the SAME modelId grouped consecutively (preferredKeyId first)
+ * so quota exhaustion automatically switches to the same model on another API key before falling back.
+ */
+export function orderCandidatesByCategoryAndSameModelFailover(
+  list: RoutedCandidate[],
+  category: ModelCategory,
+  preferredKeyId?: string
+): RoutedCandidate[] {
+  const groups = new Map<string, RoutedCandidate[]>();
+  for (const c of list) {
+    const arr = groups.get(c.modelId) || [];
+    arr.push(c);
+    groups.set(c.modelId, arr);
+  }
+
+  const rankedGroups = Array.from(groups.entries()).sort(([, aList], [, bList]) => {
+    const aRep = aList[0];
+    const bRep = bList[0];
+    const tierDiff = getModelQualityTier(aRep.modelId, aRep.modelName) - getModelQualityTier(bRep.modelId, bRep.modelName);
+    if (tierDiff !== 0) return tierDiff;
+    const catScoreDiff = getCandidateCategoryScore(bRep, category) - getCandidateCategoryScore(aRep, category);
+    if (catScoreDiff !== 0) return catScoreDiff;
+    const overallDiff = bRep.overallScore - aRep.overallScore;
+    if (overallDiff !== 0) return overallDiff;
+    return bRep.speedScore - aRep.speedScore;
+  });
+
+  const ordered: RoutedCandidate[] = [];
+  for (const [, keyCandidates] of rankedGroups) {
+    keyCandidates.sort((a, b) => {
+      if (preferredKeyId) {
+        const aPref = a.keyId === preferredKeyId ? 1 : 0;
+        const bPref = b.keyId === preferredKeyId ? 1 : 0;
+        if (aPref !== bPref) return bPref - aPref;
+      }
+      return b.speedScore - a.speedScore;
+    });
+    ordered.push(...keyCandidates);
+  }
+  return ordered;
 }
 
 function getFallbackModelsForProvider(
@@ -583,6 +582,7 @@ export async function collectAllModelCandidates(
       effectiveEntries.map(async ({ entry, secret }) => {
         if (signal?.aborted) return;
         const profile = resolveApiKeyProfile(secret, entry.providerId, entry.keyName);
+        if ((profile.baseUrl || '').includes('elevenlabs.io')) return;
         const resolvedProviderId = inferProviderFromApiKey(secret, profile.providerId);
         const dbProv = findMatchingDbProvider(dbProviders, entry, profile);
 
@@ -637,7 +637,17 @@ export async function collectAllModelCandidates(
           const resolvedTier = m?.tier || inferModelTier(m, profile, secret);
           if (resolvedTier === 'paid' && !keyAllowsPaid) continue;
 
-          const category = classifyModelCategory(m);
+          const bench = computeModelBenchmarks({
+            id: mId,
+            name: m?.name,
+            providerId: resolvedProviderId,
+            supportsReasoning: m?.supportsReasoning,
+            supportsVision: m?.supportsVision,
+            contextWindow: m?.contextWindow,
+            capabilities: m?.capabilities,
+            category: m?.category,
+          });
+          const category = bench.category;
           const scores = computeTaskScores({
             modelId: mId,
             modelName: m?.name,
@@ -658,6 +668,10 @@ export async function collectAllModelCandidates(
             modelName: m?.name || mId,
             category,
             tier: resolvedTier,
+            overallScore: bench.overallScore,
+            turboScore: scoreModelForWorkflowCategory(bench.scores, bench.overallScore, 'turbo'),
+            standardScore: scoreModelForWorkflowCategory(bench.scores, bench.overallScore, 'standard'),
+            deepThoughtScore: scoreModelForWorkflowCategory(bench.scores, bench.overallScore, 'deep-thought'),
             contextWindow: m?.contextWindow || 32000,
             ...scores,
           });
@@ -678,161 +692,12 @@ export async function collectAllModelCandidates(
   return allCandidates.filter(c => !isModelExhausted(c.keyId, c.modelId));
 }
 
-export function getOverviewerCandidates(pool: RoutedCandidate[]): RoutedCandidate[] {
-  const chatCandidates = pool.filter(c => c.modelId !== 'auto');
-  const usable = chatCandidates.length > 0 ? chatCandidates : pool;
-  const sorted = [...usable].sort((a, b) => b.speedScore - a.speedScore);
-
-  if (activeOverviewerKey) {
-    const pinnedIdx = sorted.findIndex(c => modelKey(c.keyId, c.modelId) === activeOverviewerKey);
-    if (pinnedIdx > 0) {
-      const [pinned] = sorted.splice(pinnedIdx, 1);
-      sorted.unshift(pinned);
-    }
-  }
-  return sorted;
-}
-
-function createLinkedSignal(parentSignal: AbortSignal | undefined, timeoutMs: number): {
-  signal: AbortSignal;
-  cleanup: () => void;
-  didTimeout: () => boolean;
-} {
-  const controller = new AbortController();
-  let timedOut = false;
-
-  const onParentAbort = () => controller.abort();
-  if (parentSignal) {
-    if (parentSignal.aborted) {
-      controller.abort();
-    } else {
-      parentSignal.addEventListener('abort', onParentAbort, { once: true });
-    }
-  }
-
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, timeoutMs);
-
-  return {
-    signal: controller.signal,
-    didTimeout: () => timedOut,
-    cleanup: () => {
-      clearTimeout(timer);
-      if (parentSignal) {
-        parentSignal.removeEventListener('abort', onParentAbort);
-      }
-    },
-  };
-}
-
-function buildCompactSlateForOverviewer(pool: RoutedCandidate[]): RoutedCandidate[] {
-  const chosen: RoutedCandidate[] = [];
-  const seen = new Set<string>();
-  const addTop = (task: RoutingTaskType, count: number) => {
-    const sorted = [...pool]
-      .filter(c => c.modelId !== 'auto')
-      .sort((a, b) => scoreCandidateForTask(b, task) - scoreCandidateForTask(a, task));
-    let added = 0;
-    for (const c of sorted) {
-      if (added >= count) break;
-      const k = `${c.providerId}::${c.modelId}`;
-      if (seen.has(k)) continue;
-      seen.add(k);
-      chosen.push(c);
-      added++;
-    }
-  };
-
-  addTop('higher-research', 2);
-  addTop('documentation', 2);
-  addTop('coding', 2);
-  addTop('fast-chat', 2);
-  return chosen;
-}
-
-function parseOverviewerReply(
-  raw: string,
-  slateCount: number
-): { taskType?: RoutingTaskType; candidateIndex?: number } | null {
-  if (!raw) return null;
-  const cleaned = raw.trim().replace(/```json|```/gi, '').trim();
-  const match = cleaned.match(/\{[\s\S]*\}/);
-  const jsonStr = match ? match[0] : cleaned;
-  try {
-    const parsed = JSON.parse(jsonStr);
-    const rawTask = String(parsed.t || parsed.task || '').toLowerCase();
-    let taskType: RoutingTaskType | undefined;
-    if (rawTask.includes('research') || rawTask.includes('deep')) taskType = 'higher-research';
-    else if (rawTask.includes('doc') || rawTask.includes('writ') || rawTask.includes('summ')) taskType = 'documentation';
-    else if (rawTask.includes('cod') || rawTask.includes('dev')) taskType = 'coding';
-    else if (rawTask.includes('fast') || rawTask.includes('quick') || rawTask.includes('chat')) taskType = 'fast-chat';
-
-    const idx = typeof parsed.i === 'number' ? parsed.i : Number.parseInt(String(parsed.i ?? ''), 10);
-    const candidateIndex = Number.isFinite(idx) && idx >= 0 && idx < slateCount ? idx : undefined;
-    if (!taskType && candidateIndex === undefined) return null;
-    return { taskType, candidateIndex };
-  } catch {
-    return null;
-  }
-}
-
-export type OverviewerInvoker = (params: {
-  candidate: RoutedCandidate;
-  systemPrompt: string;
-  userPrompt: string;
-  signal: AbortSignal;
-}) => Promise<string>;
-
-async function defaultOverviewerInvoker({
-  candidate,
-  systemPrompt,
-  userPrompt,
-  signal,
-}: Parameters<OverviewerInvoker>[0]): Promise<string> {
-  const profile = resolveApiKeyProfile(candidate.keySecret, candidate.providerId, candidate.keyName);
-  const inst = providerManager.getProviderForKeyProfile(candidate.providerId, candidate.keySecret);
-  if (!inst) throw new Error(`Provider unavailable: ${candidate.providerId}`);
-
-  inst.updateConfig({
-    apiKey: candidate.keySecret,
-    ...(profile.baseUrl ? { baseUrl: profile.baseUrl } : {}),
-  });
-
-  const userMsg: Message = {
-    id: `ov-${Date.now()}`,
-    conversationId: 'overviewer',
-    role: 'user',
-    content: userPrompt,
-    createdAt: Date.now(),
-    status: 'complete',
-  };
-
-  const res = await providerManager.complete(inst.getId(), {
-    model: candidate.modelId,
-    systemPrompt,
-    messages: [userMsg],
-    temperature: 0,
-    maxTokens: 48,
-    signal,
-  });
-  return res?.content || '';
-}
-
-function classifyTaskForSummary(c: RoutedCandidate): RoutingTaskType {
-  if (c.researchScore >= c.speedScore && c.researchScore >= c.documentationScore) return 'higher-research';
-  if (c.documentationScore >= c.speedScore) return 'documentation';
-  if (c.codingScore >= c.speedScore) return 'coding';
-  return 'fast-chat';
-}
-
 /**
- * Routes a chat turn without any caching:
- * - Manual model: uses chosen model + failover chain.
- * - Auto mode with NO trigger keyword: runs directly on the single fastest base model.
- * - Auto mode WITH a trigger keyword (or explicit workflow): activates the Overviewer model
- *   to pick the right model for that workflow, failing over automatically on quota limits.
+ * Routes a turn strictly within the user's manually chosen workflow category ('turbo' | 'standard' | 'deep-thought'):
+ * - Ranks models in that category by their Overview 0-100 score (best model first).
+ * - Keeps all configured API keys for the SAME model consecutively so quota exhaustion switches
+ *   to another API key with the same model before falling back to the next-best model.
+ * - Pre-checks / re-evaluates from the #1 Overview model on every turn once cooldown expires.
  */
 export async function routeTurnWithOverviewer(params: {
   pool: RoutedCandidate[];
@@ -845,212 +710,107 @@ export async function routeTurnWithOverviewer(params: {
   hasAnyAttachment?: boolean;
   preferredFailover?: boolean;
   signal?: AbortSignal;
-  invoker?: OverviewerInvoker;
   onStatus?: (message: string) => void;
 }): Promise<OverviewerDecision | null> {
   const startedAt = Date.now();
   const {
     pool,
-    promptText,
     requestedModel,
     preferredKeyId,
-    workflowMode = 'auto',
-    reasoningEffort,
-    hasHeavyAttachments,
+    workflowMode = 'standard',
     preferredFailover = true,
-    signal,
-    invoker = defaultOverviewerInvoker,
-    onStatus,
   } = params;
 
   if (pool.length === 0) return null;
 
-  const isManualModel = Boolean(requestedModel && requestedModel !== 'auto' && requestedModel !== 'default');
-  const keywordMatch = detectKeywordTrigger({
-    promptText,
-    hasHeavyAttachments,
-    workflowMode,
-    reasoningEffort,
-  });
-  let taskType: RoutingTaskType = keywordMatch?.taskType || 'fast-chat';
+  const activeCategory: ModelCategory =
+    workflowMode === 'turbo' || workflowMode === 'standard' || workflowMode === 'deep-thought'
+      ? workflowMode
+      : 'standard';
+  const taskType = mapCategoryToTaskType(activeCategory);
 
-  // Manual model override
-  if (isManualModel) {
-    const manualMatch =
-      pool.find(c => c.modelId === requestedModel && (!preferredKeyId || c.keyId === preferredKeyId)) ||
-      pool.find(c => c.modelId === requestedModel);
+  const isManualModel = Boolean(
+    requestedModel &&
+      requestedModel !== 'auto' &&
+      requestedModel !== 'default' &&
+      requestedModel !== 'category-best'
+  );
 
-    if (manualMatch) {
-      const backups = preferredFailover
-        ? [...pool]
-            .filter(c => !(c.keyId === manualMatch.keyId && c.modelId === manualMatch.modelId))
-            .sort((a, b) => scoreCandidateForTask(b, taskType) - scoreCandidateForTask(a, taskType))
+  // Manual model selection: try the selected model on preferredKeyId first, then the SAME model on any other API key
+  if (isManualModel && requestedModel) {
+    const sameModelMatches = pool
+      .filter(c => c.modelId === requestedModel)
+      .sort((a, b) => {
+        if (preferredKeyId) {
+          const aPref = a.keyId === preferredKeyId ? 1 : 0;
+          const bPref = b.keyId === preferredKeyId ? 1 : 0;
+          if (aPref !== bPref) return bPref - aPref;
+        }
+        return b.speedScore - a.speedScore;
+      });
+
+    if (sameModelMatches.length > 0) {
+      const sameCategoryBackups = preferredFailover
+        ? orderCandidatesByCategoryAndSameModelFailover(
+            pool.filter(c => c.modelId !== requestedModel && c.category === activeCategory),
+            activeCategory,
+            preferredKeyId
+          )
         : [];
-      const candidates = [manualMatch, ...backups];
+      const otherCategoryBackups = preferredFailover
+        ? orderCandidatesByCategoryAndSameModelFailover(
+            pool.filter(c => c.modelId !== requestedModel && c.category !== activeCategory),
+            activeCategory,
+            preferredKeyId
+          )
+        : [];
+      const candidates = [...sameModelMatches, ...sameCategoryBackups, ...otherCategoryBackups];
       return {
         taskType,
-        category: manualMatch.category,
+        category: sameModelMatches[0].category,
         triggeredByKeyword: false,
-        selected: manualMatch,
+        selected: candidates[0],
         candidates,
         overviewerReplaced: [],
         decisionMs: Date.now() - startedAt,
-        usedHeuristic: true,
-        reason: `Manual model "${manualMatch.modelId}" selected`,
+        usedHeuristic: false,
+        reason: `Manual model "${sameModelMatches[0].modelId}" selected`,
       };
     }
   }
 
-  // No trigger keyword: run directly on the single fastest base model (zero Overviewer latency/overhead)
-  if (!keywordMatch) {
-    const defaultOrdered = [...pool].sort((a, b) => {
-      if (preferredKeyId) {
-        const aPref = a.keyId === preferredKeyId ? 1 : 0;
-        const bPref = b.keyId === preferredKeyId ? 1 : 0;
-        if (aPref !== bPref) return bPref - aPref;
-      }
-      return b.speedScore - a.speedScore;
-    });
-    const finalCandidates = preferredFailover ? defaultOrdered : [defaultOrdered[0]];
-    return {
-      taskType: 'fast-chat',
-      category: 'turbo',
-      triggeredByKeyword: false,
-      selected: finalCandidates[0],
-      candidates: finalCandidates,
-      overviewerReplaced: [],
-      decisionMs: Date.now() - startedAt,
-      usedHeuristic: true,
-      reason: `No trigger keyword — running base fast model "${finalCandidates[0].modelId}"`,
-    };
-  }
+  // Strictly select the highest Overview-scoring model under the chosen workflow category
+  const inCategory = orderCandidatesByCategoryAndSameModelFailover(
+    pool.filter(c => c.category === activeCategory),
+    activeCategory,
+    preferredKeyId
+  );
+  const outOfCategory = orderCandidatesByCategoryAndSameModelFailover(
+    pool.filter(c => c.category !== activeCategory),
+    activeCategory,
+    preferredKeyId
+  );
 
-  // Trigger keyword detected -> run the Overviewer model to select workflow model
-  const overviewerChain = getOverviewerCandidates(pool);
-  const overviewerReplaced: Array<{ modelId: string; providerId: string; reason: string }> = [];
-  let overviewerUsed: OverviewerDecision['overviewerUsed'];
-  let overviewerPick: RoutedCandidate | undefined;
-  let usedHeuristic = true;
-  let reason = `Keyword "${keywordMatch.keyword}" triggered ${taskType}`;
-
-  const shouldInvokeOverviewer =
-    workflowMode === 'auto' &&
-    overviewerChain.length > 0 &&
-    pool.length > 1 &&
-    !signal?.aborted;
-
-  if (shouldInvokeOverviewer) {
-    const slate = buildCompactSlateForOverviewer(pool);
-    if (slate.length > 0) {
-      const slateSummary = slate
-        .map((c, idx) => `${idx}:${c.modelId}[${mapTaskTypeToCategory(classifyTaskForSummary(c))}]`)
-        .join(' ');
-
-      const ovSystem =
-        'You are the EXCO Overviewer Router. Reply ONLY with JSON {"t":"research"|"docs"|"code"|"fast","i":<index>}. ' +
-        'Choose which workflow & model index best fits the triggered request.';
-      const snippet = (promptText || '').trim().slice(0, 360);
-      const ovUser = `Trigger: ${keywordMatch.keyword}\nModels: ${slateSummary}\nTask: ${snippet}`;
-
-      for (let attempt = 0; attempt < Math.min(2, overviewerChain.length); attempt++) {
-        if (signal?.aborted) break;
-        const ovCandidate = overviewerChain[attempt];
-        onStatus?.(`Overviewer (${ovCandidate.modelId}) classifying "${keywordMatch.keyword}"...`);
-        const linked = createLinkedSignal(signal, OVERVIEWER_TIMEOUT_MS);
-        try {
-          const reply = await invoker({
-            candidate: ovCandidate,
-            systemPrompt: ovSystem,
-            userPrompt: ovUser,
-            signal: linked.signal,
-          });
-          linked.cleanup();
-
-          activeOverviewerKey = modelKey(ovCandidate.keyId, ovCandidate.modelId);
-          overviewerUsed = {
-            keyId: ovCandidate.keyId,
-            keyName: ovCandidate.keyName,
-            providerId: ovCandidate.providerId,
-            modelId: ovCandidate.modelId,
-          };
-
-          const parsed = parseOverviewerReply(reply, slate.length);
-          if (parsed?.taskType) {
-            taskType = parsed.taskType;
-            usedHeuristic = false;
-            reason = `Overviewer (${ovCandidate.modelId}) selected ${taskType} for trigger "${keywordMatch.keyword}"`;
-          }
-          if (parsed?.candidateIndex !== undefined) {
-            overviewerPick = slate[parsed.candidateIndex];
-          }
-          break;
-        } catch (err: any) {
-          linked.cleanup();
-          if (signal?.aborted) break;
-          if (linked.didTimeout()) {
-            overviewerUsed = {
-              keyId: ovCandidate.keyId,
-              keyName: ovCandidate.keyName,
-              providerId: ovCandidate.providerId,
-              modelId: ovCandidate.modelId,
-            };
-            reason = `Keyword trigger "${keywordMatch.keyword}" -> ${taskType} (${OVERVIEWER_TIMEOUT_MS}ms Overviewer cap)`;
-            break;
-          }
-          const errText = err instanceof Error ? err.message : String(err || 'error');
-          if (isQuotaOrModelUnavailableError(err)) {
-            markModelExhausted(ovCandidate.keyId, ovCandidate.modelId, errText);
-            overviewerReplaced.push({
-              modelId: ovCandidate.modelId,
-              providerId: ovCandidate.providerId,
-              reason: errText,
-            });
-            if (overviewerChain[attempt + 1]) {
-              onStatus?.(`Overviewer limit on ${ovCandidate.modelId} — switching to ${overviewerChain[attempt + 1].modelId}...`);
-            }
-            continue;
-          }
-          break;
-        }
-      }
-    }
-  }
-
-  const ranked = [...pool].sort((a, b) => {
-    const scoreDiff = scoreCandidateForTask(b, taskType) - scoreCandidateForTask(a, taskType);
-    if (scoreDiff !== 0) return scoreDiff;
-    if (preferredKeyId) {
-      const aPref = a.keyId === preferredKeyId ? 1 : 0;
-      const bPref = b.keyId === preferredKeyId ? 1 : 0;
-      if (aPref !== bPref) return bPref - aPref;
-    }
-    return b.speedScore - a.speedScore;
-  });
-
-  let ordered = ranked;
-  if (overviewerPick && ranked.length > 0) {
-    const bestScore = scoreCandidateForTask(ranked[0], taskType);
-    const pickScore = scoreCandidateForTask(overviewerPick, taskType);
-    if (pickScore >= bestScore - 15) {
-      ordered = [
-        overviewerPick,
-        ...ranked.filter(c => !(c.keyId === overviewerPick!.keyId && c.modelId === overviewerPick!.modelId)),
-      ];
-    }
-  }
+  const ordered =
+    inCategory.length > 0
+      ? preferredFailover
+        ? [...inCategory, ...outOfCategory]
+        : inCategory
+      : outOfCategory;
 
   const finalCandidates = preferredFailover ? ordered : [ordered[0]];
+  const winner = finalCandidates[0];
+  const winnerScore = getCandidateCategoryScore(winner, activeCategory);
+
   return {
     taskType,
-    category: mapTaskTypeToCategory(taskType),
-    triggeredByKeyword: true,
-    triggerKeyword: keywordMatch.keyword,
-    selected: finalCandidates[0],
+    category: activeCategory,
+    triggeredByKeyword: false,
+    selected: winner,
     candidates: finalCandidates,
-    overviewerUsed,
-    overviewerReplaced,
+    overviewerReplaced: [],
     decisionMs: Date.now() - startedAt,
-    usedHeuristic,
-    reason,
+    usedHeuristic: false,
+    reason: `Overview #1 in ${activeCategory}: "${winner.modelId}" (${winnerScore}/100)`,
   };
 }

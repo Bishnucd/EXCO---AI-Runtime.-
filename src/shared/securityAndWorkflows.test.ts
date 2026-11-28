@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
   classifyModelCategory,
+  computeModelBenchmarks,
+  segregateCategoryFromScores,
+  scoreModelForWorkflowCategory,
   isPathWithin,
   resolveApiKeyProfile,
   inferProviderFromApiKey,
@@ -27,6 +30,7 @@ describe('EXCO Shared Security, Sanitization, Schema & Workflow Tests', () => {
         { key: 'AIzaSyDummyGoogleKeyForUnitTest12345', expectedProvider: 'google', expectedName: 'Google Gemini' },
         { key: 'sk-ant-api03-testkey1234567890', expectedProvider: 'anthropic', expectedName: 'Anthropic Claude' },
         { key: 'gsk_testkey1234567890', expectedProvider: 'custom', expectedName: 'Groq' },
+        { key: 'sk_testkey1234567890', expectedProvider: 'custom', expectedName: 'ElevenLabs' },
       ];
       for (const c of cases) {
         const profile = resolveApiKeyProfile(c.key);
@@ -35,16 +39,39 @@ describe('EXCO Shared Security, Sanitization, Schema & Workflow Tests', () => {
         expect(JSON.stringify(profile)).not.toContain(c.key);
       }
 
+      const elevenLabsProfile = resolveApiKeyProfile('sk_testkey1234567890');
+      expect(elevenLabsProfile.baseUrl).toBe('https://api.elevenlabs.io/v1');
+      expect(elevenLabsProfile.providerId).not.toBe('openai');
+
       expect(resolveApiKeyProfile('opaque-key', 'custom', 'Aion Labs').baseUrl).toBe('https://api.aionlabs.ai/v1');
       expect(resolveApiKeyProfile('opaque-key', 'custom', 'Parallel').baseUrl).toBe('https://api.parallel.ai/v1');
       expect(resolveApiKeyProfile('opaque-key', 'custom', 'LLM7').baseUrl).toBe('https://api.llm7.io/v1');
       expect(inferProviderFromApiKey('nvapi-abc')).toBe('custom');
     });
 
-    it('classifies turbo, standard, and deep-thought models cleanly', () => {
+    it('classifies turbo, standard, and deep-thought models cleanly via 0-100 Overview scores', () => {
+      const flash = computeModelBenchmarks({ id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' });
+      const r1 = computeModelBenchmarks({ id: 'deepseek-r1', name: 'DeepSeek R1 Reasoning' });
+      const gpt4o = computeModelBenchmarks({ id: 'gpt-4o', name: 'GPT-4o' });
+
+      expect(flash.category).toBe('turbo');
+      expect(r1.category).toBe('deep-thought');
+      expect(gpt4o.category).toBe('standard');
+
       expect(classifyModelCategory({ id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' })).toBe('turbo');
       expect(classifyModelCategory({ id: 'deepseek-r1', name: 'DeepSeek R1 Reasoning' })).toBe('deep-thought');
       expect(classifyModelCategory({ id: 'gpt-4o', name: 'GPT-4o' })).toBe('standard');
+
+      expect(segregateCategoryFromScores(flash.scores)).toBe('turbo');
+      expect(segregateCategoryFromScores(r1.scores)).toBe('deep-thought');
+      expect(segregateCategoryFromScores(gpt4o.scores)).toBe('standard');
+
+      expect(scoreModelForWorkflowCategory(flash.scores, flash.overallScore, 'turbo')).toBeGreaterThan(
+        scoreModelForWorkflowCategory(gpt4o.scores, gpt4o.overallScore, 'turbo')
+      );
+      expect(scoreModelForWorkflowCategory(r1.scores, r1.overallScore, 'deep-thought')).toBeGreaterThan(
+        scoreModelForWorkflowCategory(flash.scores, flash.overallScore, 'deep-thought')
+      );
     });
 
     it('encodes and parses voice sessions safely', () => {

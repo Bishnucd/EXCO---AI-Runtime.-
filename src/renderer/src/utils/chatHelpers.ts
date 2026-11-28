@@ -3,40 +3,33 @@
  * Reusable workflow metadata, formatting helpers, and 16kHz PCM WAV voice encoder
  */
 
-export type WorkflowSelection = 'auto' | 'turbo' | 'standard' | 'deep-thought';
+export type WorkflowSelection = 'turbo' | 'standard' | 'deep-thought';
 
 export interface WorkflowOptionMeta {
-  id: 'turbo' | 'standard' | 'deep-thought';
+  id: WorkflowSelection;
   label: string;
   shortDesc: string;
   detail: string;
 }
-
-export const AUTO_WORKFLOW_INFO = {
-  id: 'auto' as const,
-  label: 'Auto',
-  shortDesc: 'Smartly chooses Turbo, Standard, or Deep Thought for your prompt',
-  detail: 'Inspects prompt length, complexity, code/planning keywords, and attachments to route to the best category automatically.',
-};
 
 export const WORKFLOW_CATEGORIES: WorkflowOptionMeta[] = [
   {
     id: 'turbo',
     label: 'Turbo',
     shortDesc: 'Ultra-fast instant responses for quick questions & drafting',
-    detail: 'Routes to low-latency high-speed models (Flash / Mini / Haiku) for snappy turnarounds.',
+    detail: 'Selects the highest-scoring fast models (Flash / Mini / Haiku) ranked by Overview speed & efficiency scores.',
   },
   {
     id: 'standard',
     label: 'Standard',
     shortDesc: 'Balanced speed, depth & reliability for everyday tasks',
-    detail: 'Routes to balanced flagship chat models across your configured API keys.',
+    detail: 'Selects the highest-scoring balanced flagship models ranked by Overview overall scores across your configured API keys.',
   },
   {
     id: 'deep-thought',
     label: 'Deep Thought',
     shortDesc: 'Maximum reasoning depth for coding, math & complex plans',
-    detail: 'Routes to frontier reasoning models for complex architecture, analysis, and debugging.',
+    detail: 'Selects the highest-scoring frontier reasoning models ranked by Overview research & coding scores.',
   },
 ];
 

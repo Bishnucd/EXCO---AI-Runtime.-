@@ -144,7 +144,7 @@ export function InfoPage() {
               <span className="text-xs font-bold uppercase tracking-wider text-[rgb(var(--color-accent-ink))]">Step 3</span>
               <h3 className="font-semibold text-sm">Select Key, Model &amp; Chat</h3>
               <p className="text-xs text-[rgb(var(--color-foreground-muted))] leading-relaxed">
-                Use the bottom-left pills in the chat prompt box to pick your saved key and preferred model (or leave on <strong>Auto</strong>), type your message, and press <strong>Enter</strong>.
+                Use the bottom-right Workflow pill to choose <strong>Turbo</strong>, <strong>Standard</strong>, or <strong>Deep Thought</strong>, pick a specific model or <strong>Best in Category</strong> on the left, type your message, and press <strong>Enter</strong>.
               </p>
             </div>
           </div>
@@ -181,7 +181,7 @@ export function InfoPage() {
               Click <strong>Sidebar → API Keys → Add Key</strong>, give it a clear label, paste your API key, and click <strong>Add Key</strong>. EXCO stores keys strictly locally.
             </li>
             <li>
-              In the Chat bar, select your named key and click the <strong>Model</strong> pill to choose <strong>Auto</strong> or pick a specific model from the live list returned by your provider.
+              In the Chat bar, choose <strong>Turbo</strong>, <strong>Standard</strong>, or <strong>Deep Thought</strong>, and click the <strong>Model</strong> pill to use the top-scoring Overview model or pick any specific model from your provider.
             </li>
           </ol>
         </section>
@@ -247,7 +247,7 @@ export function InfoPage() {
               <span>Model Preferences, Token Tracking &amp; Tiers</span>
             </h3>
             <p className="text-xs text-[rgb(var(--color-foreground-muted))] leading-relaxed">
-              Click the <strong>Model</strong> selector next to your API key pill in Chat to choose <strong>Auto</strong> or pick any available model. Each entry shows concise <strong>Used / Capacity</strong> token numbers and <strong>Free</strong> / <strong>Paid</strong> tier badges, with a <strong>Fallback</strong> option to automatically switch if a rate limit is hit.
+              Choose <strong>Turbo</strong>, <strong>Standard</strong>, or <strong>Deep Thought</strong> in the Workflow pill, then click the <strong>Model</strong> selector to use the highest-scoring Overview model in that tier or pick any available model. Each entry shows concise <strong>Used / Capacity</strong> token numbers and <strong>Free</strong> / <strong>Paid</strong> tier badges, with <strong>Fallback</strong> switching across API keys and next-best models if a rate limit is hit.
             </p>
           </div>
 

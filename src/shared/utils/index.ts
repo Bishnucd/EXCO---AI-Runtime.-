@@ -553,8 +553,37 @@ export function randomInt(min: number, max: number): number {
 // AI Provider & Model Workflow Utilities
 // ============================================================================
 
-export type ModelCategory = 'turbo' | 'standard' | 'deep-thought';
-export type WorkflowSelection = 'auto' | ModelCategory;
+import {
+  computeModelBenchmarks,
+  segregateCategoryFromScores,
+  scoreModelForWorkflowCategory,
+  type ModelCategory,
+  type WorkflowSelection,
+  type ModelChecklistScores,
+  type EvaluatedSystemModel,
+  type DailyBenchmarkSnapshot,
+  type MajorUseCase,
+  type ChecklistColumn,
+  type ModelBenchmarkEvalInput,
+  CHECKLIST_COLUMNS,
+  evaluateSystemModel,
+} from './modelBenchmarks';
+
+export {
+  computeModelBenchmarks,
+  segregateCategoryFromScores,
+  scoreModelForWorkflowCategory,
+  CHECKLIST_COLUMNS,
+  evaluateSystemModel,
+  type ModelCategory,
+  type WorkflowSelection,
+  type ModelChecklistScores,
+  type EvaluatedSystemModel,
+  type DailyBenchmarkSnapshot,
+  type MajorUseCase,
+  type ChecklistColumn,
+  type ModelBenchmarkEvalInput,
+};
 
 export interface WorkflowCategoryInfo {
   id: ModelCategory;
@@ -563,61 +592,30 @@ export interface WorkflowCategoryInfo {
   detail: string;
 }
 
-export const AUTO_WORKFLOW_INFO = {
-  id: 'auto' as const,
-  label: 'Auto',
-  shortDesc: 'Automatic Turbo / Standard / Deep Thought',
-  detail: 'Automatically selects Turbo for quick prompts, Standard for everyday tasks, or Deep Thought for complex coding, reasoning, or attached files.',
-};
-
 export const WORKFLOW_CATEGORIES: WorkflowCategoryInfo[] = [
   {
     id: 'turbo',
     label: 'Turbo',
     shortDesc: 'Maximum speed & instant answers',
-    detail: 'Routes to fast, lightweight models (Flash, Mini, Haiku, Nano) for quick chat, summaries, and low-latency tasks.',
+    detail: 'Selects the highest-scoring fast models (Flash, Mini, Haiku, 8B Instant) ranked by Overview speed & efficiency scores.',
   },
   {
     id: 'standard',
     label: 'Standard',
     shortDesc: 'Balanced quality & everyday coding',
-    detail: 'Routes to versatile general-purpose models for writing, everyday Q&A, analysis, and multi-step tasks.',
+    detail: 'Selects the highest-scoring balanced models ranked by Overview overall chat, instruction, and coding scores.',
   },
   {
     id: 'deep-thought',
     label: 'Deep Thought',
     shortDesc: 'Extended reasoning & complex work',
-    detail: 'Routes to high-capacity reasoning models (Pro, Opus, Sonnet 4, o1/o3/R1) for architecture, debugging, and hard problems.',
+    detail: 'Selects the highest-scoring deep reasoning models (Pro, Opus, Sonnet 4, o1/o3/R1) ranked by Overview research & coding scores.',
   },
 ];
 
-export function classifyModelCategory(model: {
-  id?: string;
-  name?: string;
-  supportsReasoning?: boolean;
-  category?: ModelCategory;
-}): ModelCategory {
+export function classifyModelCategory(model: ModelBenchmarkEvalInput): ModelCategory {
   if (model.category) return model.category;
-  const text = `${model.id || ''} ${model.name || ''}`.toLowerCase();
-
-  // Check lightweight/speed models first so names like "flash-thinking" or "o3-mini" still resolve cleanly:
-  // explicit reasoning/deep models win if they are frontier reasoning tiers unless marked mini/flash/lite/haiku/nano
-  const isLightweight = /\b(flash|mini|haiku|nano|instant|lite|fast|8b|7b|4b|3b|1b|small|speed)\b/.test(text);
-  const isDeepReasoning =
-    Boolean(model.supportsReasoning) ||
-    /\b(opus|o1|o3|o4|r1|qwq|reasoner|thinking|deep|sonnet[-_ ]?4|sonnet[-_ ]?3[._-]7|gemini[-_ ]?(2\.5|3(\.\d+)?)[-_ ]?pro|1\.5[-_ ]?pro|405b)\b/.test(text) ||
-    /[-_/]pro$/.test(text.trim());
-
-  if (isDeepReasoning && !text.includes('mini') && !text.includes('flash') && !text.includes('lite')) {
-    return 'deep-thought';
-  }
-  if (isLightweight) {
-    return 'turbo';
-  }
-  if (isDeepReasoning) {
-    return 'deep-thought';
-  }
-  return 'standard';
+  return computeModelBenchmarks(model).category;
 }
 
 export function getProviderDisplayName(providerId?: string): string {
@@ -634,8 +632,6 @@ export function getProviderDisplayName(providerId?: string): string {
       return 'Ollama';
     case 'custom':
       return 'Custom Gateway';
-    case 'auto':
-      return 'Auto Router';
     default:
       return providerId ? capitalize(providerId) : 'Unknown Provider';
   }
@@ -797,6 +793,15 @@ const API_KEY_PREFIX_PROFILES: Array<{ prefix: string; profile: ApiKeyProfile }>
     },
   },
   {
+    prefix: 'sk_',
+    profile: {
+      providerId: 'custom',
+      displayName: 'ElevenLabs',
+      baseUrl: 'https://api.elevenlabs.io/v1',
+      tier: 'free',
+    },
+  },
+  {
     prefix: 'sk-',
     profile: {
       providerId: 'openai',
@@ -808,6 +813,10 @@ const API_KEY_PREFIX_PROFILES: Array<{ prefix: string; profile: ApiKeyProfile }>
 ];
 
 const HINT_PROFILES: Array<{ keywords: string[]; profile: ApiKeyProfile }> = [
+  {
+    keywords: ['elevenlabs', 'eleven labs', '11labs'],
+    profile: { providerId: 'custom', displayName: 'ElevenLabs', baseUrl: 'https://api.elevenlabs.io/v1', tier: 'free' },
+  },
   {
     keywords: ['nvidia', 'nim'],
     profile: API_KEY_PREFIX_PROFILES[0].profile,
