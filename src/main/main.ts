@@ -324,7 +324,7 @@ interface AppUpdateState {
 
 let updateState: AppUpdateState = {
   status: 'idle',
-  currentVersion: '0.1.0',
+  currentVersion: '0.1.1',
 };
 
 function emitUpdateStatus(patch: Partial<AppUpdateState>): void {
