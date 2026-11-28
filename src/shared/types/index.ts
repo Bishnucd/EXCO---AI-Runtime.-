@@ -86,6 +86,24 @@ export interface TokenUsage {
   totalTokens: number;
 }
 
+export interface VoiceTranscriptEntry {
+  id: string;
+  role: 'user' | 'assistant';
+  text: string;
+  timestamp: number;
+  modelId?: string;
+  providerId?: string;
+}
+
+export interface VoiceSessionPayload {
+  version: 1;
+  startedAt: number;
+  endedAt: number;
+  durationSec: number;
+  entries: VoiceTranscriptEntry[];
+  modelsUsed?: string[];
+}
+
 // ============================================================================
 // AI Provider Types
 // ============================================================================
@@ -179,6 +197,7 @@ export interface WorkProject {
   folders: Workspace[];
   syncedProjectIds: string[];
   conversationId?: string;
+  conversationIds?: string[];
   createdAt: number;
   updatedAt: number;
 }

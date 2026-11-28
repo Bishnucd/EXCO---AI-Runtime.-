@@ -177,7 +177,10 @@ export function searchActiveSkills(query: string, category?: string, limit = 12)
 
   if (!q) return pool.slice(0, limit);
 
-  const tokens = q.split(/[^a-z0-9+.#-]+/).filter(Boolean);
+  const stopWords = new Set(['the', 'and', 'for', 'with', 'that', 'this', 'from', 'your', 'into', 'what', 'how', 'can', 'you', 'are', 'was', 'were', 'who', 'why', 'when', 'where', 'hear', 'talk', 'tell', 'say', 'yes', 'hey', 'please', 'help', 'make', 'create', 'build']);
+  const tokens = q
+    .split(/[^a-z0-9+.#-]+/)
+    .filter(tok => tok.length >= 3 && !stopWords.has(tok));
   const scored: Array<{ skill: RegistrySkillItem; score: number }> = [];
 
   for (const s of pool) {
@@ -186,14 +189,14 @@ export function searchActiveSkills(query: string, category?: string, limit = 12)
     const catL = `${s.category} ${s.subcategory}`.toLowerCase();
     let score = 0;
     if (nameL === q) score += 20;
-    else if (nameL.includes(q)) score += 10;
+    else if (q.length >= 4 && nameL.includes(q)) score += 10;
     for (const tok of tokens) {
-      if (tok.length < 2) continue;
-      if (nameL.includes(tok)) score += 6;
-      if (catL.includes(tok)) score += 3;
-      if (descL.includes(tok)) score += 2;
+      const wordRe = new RegExp(`\\b${tok.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+      if (wordRe.test(nameL)) score += 6;
+      if (wordRe.test(catL)) score += 3;
+      if (wordRe.test(descL)) score += 2;
     }
-    if (score > 0) scored.push({ skill: s, score });
+    if (score >= 4) scored.push({ skill: s, score });
   }
 
   scored.sort((a, b) => b.score - a.score);

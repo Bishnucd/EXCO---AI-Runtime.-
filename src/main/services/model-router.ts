@@ -53,31 +53,76 @@ export interface OverviewerDecision {
 
 const EXHAUSTED_COOLDOWN_MS = 10 * 60 * 1000;
 const OVERVIEWER_TIMEOUT_MS = 450;
-const DISCOVERY_TIMEOUT_MS = 1600;
+const DISCOVERY_TIMEOUT_MS = 1100;
+const CANDIDATE_POOL_TTL_MS = 60 * 1000;
 
 const exhaustedUntil = new Map<string, { until: number; reason: string }>();
+const exhaustedKeysUntil = new Map<string, { until: number; reason: string }>();
 let activeOverviewerKey: string | null = null;
+let cachedPoolEntry: { keysSig: string; fetchedAt: number; candidates: RoutedCandidate[] } | null = null;
+let inFlightPoolPromise: Promise<RoutedCandidate[]> | null = null;
 
 function modelKey(keyId: string, modelId: string): string {
   return `${keyId}::${modelId}`;
 }
 
+export function invalidateCandidatePoolCache(): void {
+  cachedPoolEntry = null;
+}
+
 export function clearRouterStateForTests(): void {
   exhaustedUntil.clear();
+  exhaustedKeysUntil.clear();
   activeOverviewerKey = null;
+  cachedPoolEntry = null;
+  inFlightPoolPromise = null;
+}
+
+export function isAuthError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err || '')).toLowerCase();
+  return (
+    msg.includes('401') ||
+    msg.includes('403') ||
+    msg.includes('unauthorized') ||
+    msg.includes('unauthenticated') ||
+    msg.includes('invalid api key') ||
+    msg.includes('invalid_api_key') ||
+    msg.includes('incorrect api key') ||
+    msg.includes('invalid x-api-key') ||
+    msg.includes('authentication') ||
+    msg.includes('permission denied') ||
+    msg.includes('forbidden')
+  );
+}
+
+export function markKeyAuthFailed(keyId: string, reason = 'unauthorized'): void {
+  if (!keyId) return;
+  exhaustedKeysUntil.set(keyId, { until: Date.now() + EXHAUSTED_COOLDOWN_MS, reason });
 }
 
 export function markModelExhausted(keyId: string, modelId: string, reason = 'quota'): void {
   if (!modelId) return;
   const k = modelKey(keyId || 'default', modelId);
   exhaustedUntil.set(k, { until: Date.now() + EXHAUSTED_COOLDOWN_MS, reason });
+  if (isAuthError(reason)) {
+    markKeyAuthFailed(keyId || 'default', reason);
+  }
   if (activeOverviewerKey === k) {
     activeOverviewerKey = null;
   }
 }
 
 export function isModelExhausted(keyId: string, modelId: string): boolean {
-  const k = modelKey(keyId || 'default', modelId);
+  const kid = keyId || 'default';
+  const keyEntry = exhaustedKeysUntil.get(kid);
+  if (keyEntry) {
+    if (Date.now() > keyEntry.until) {
+      exhaustedKeysUntil.delete(kid);
+    } else {
+      return true;
+    }
+  }
+  const k = modelKey(kid, modelId);
   const entry = exhaustedUntil.get(k);
   if (!entry) return false;
   if (Date.now() > entry.until) {
@@ -88,6 +133,7 @@ export function isModelExhausted(keyId: string, modelId: string): boolean {
 }
 
 export function isQuotaOrModelUnavailableError(err: unknown): boolean {
+  if (isAuthError(err)) return true;
   const msg = (err instanceof Error ? err.message : String(err || '')).toLowerCase();
   return (
     msg.includes('token') ||
@@ -118,9 +164,40 @@ export function isQuotaOrModelUnavailableError(err: unknown): boolean {
 export function isNonChatUtilityModel(modelId: string, modelName = ''): boolean {
   const text = `${modelId} ${modelName}`.toLowerCase();
   if (text.trim() === 'auto') return false;
-  return /(embed|embedqa|nv-embed|bge-|e5-|rerank|nemoretriever|arctic-embed|tts|whisper|transcribe|imagen|dall-e|flux|stable-diffusion|moderation|guard|shield|nemoguard|safety|topic-control|content-safety|parse|ocr|deplot|kosmos|audio|speech|realtime|live|robotics|gliner|pii|detector|synthetic-video|cosmos-|nvclip|riva-translate|ising-|calibration|starcoder2)/.test(
+  return /(embed|embedqa|nv-embed|bge-|e5-|rerank|nemoretriever|arctic-embed|tts|whisper|transcribe|imagen|veo|dall-e|flux|stable-diffusion|moderation|guard|shield|nemoguard|safety|topic-control|content-safety|parse|ocr|deplot|kosmos|audio|speech|realtime|live|robotics|computer-use|deep-research|gliner|pii|detector|synthetic-video|cosmos-|nvclip|riva-translate|ising-|calibration|starcoder2)/.test(
     text
   );
+}
+
+/**
+ * Classifies models into strict reputation tiers so leading flagship models are ALWAYS chosen first,
+ * secondary known models second, and obscure/unknown engines ONLY when all leading options are exhausted.
+ */
+export type ModelQualityTier = 1 | 2 | 3;
+
+export function getModelQualityTier(modelId: string, modelName = ''): ModelQualityTier {
+  const text = `${modelId} ${modelName}`.toLowerCase();
+  if (/\b(allam|saba|palmyra|aion-rp|granite-?3b|gemma-2b)\b/.test(text)) {
+    return 3;
+  }
+  // Tier 1: Industry-leading frontier & flagship conversational engines
+  const isLeading =
+    /\b(gemini-3(\.\d+)?|gemini-2\.5-flash(-lite)?|gemini-2\.5-pro|gemini-2\.0-flash)\b/.test(text) ||
+    /\b(gpt-5(\.\d+)?|gpt-4\.1|gpt-4o|chatgpt-4o|o3|o4-mini)\b/.test(text) ||
+    /\b(claude-(opus|sonnet|haiku)-4(\.\d+)?|claude-3[._-][57]-(sonnet|haiku)|claude-3\.5|claude-3\.7)\b/.test(text) ||
+    /\b(llama-3\.3-70b|llama-4-maverick|llama-4-scout|llama-3\.1-70b|llama-3\.1-8b-instant)\b/.test(text) ||
+    /\b(deepseek-chat|deepseek-v3(\.\d+)?|deepseek-r1|qwen-?2\.5-72b|qwen3-?(235b|32b|30b)|mistral-large|grok-[234])\b/.test(text);
+  if (isLeading) return 1;
+
+  // Tier 2: Secondary known solid families
+  const isSecondary =
+    /\b(gemini-1\.5|gemma-3|mistral-small|codestral|qwen-?2\.5|qwen3|llama-3\.2|phi-4|command-a|command-r|gpt-3\.5-turbo|claude-3-(haiku|sonnet))\b/.test(
+      text
+    );
+  if (isSecondary) return 2;
+
+  // Tier 3: Unknown, obscure, proxy aliases, or niche community fine-tunes
+  return 3;
 }
 
 export function scoreCandidateForSpeed(params: {
@@ -132,26 +209,39 @@ export function scoreCandidateForSpeed(params: {
 }): number {
   const text = `${params.modelId} ${params.modelName || ''}`.toLowerCase();
   const base = (params.baseUrl || '').toLowerCase();
-  let score = 50;
+  const qualityTier = getModelQualityTier(params.modelId, params.modelName || '');
 
-  if (base.includes('groq.com')) score += 42;
-  else if (base.includes('cerebras')) score += 45;
-  else if (base.includes('sambanova')) score += 36;
-  else if (params.providerId === 'google') score += 20;
-  else if (base.includes('nvidia.com')) score += 14;
-  else if (params.providerId === 'openai') score += 12;
-  else if (params.providerId === 'anthropic') score += 10;
+  // Strict tier separation: Leading models (200+) ALWAYS outrank Secondary (80+) and Obscure (0+)
+  let score = qualityTier === 1 ? 220 : qualityTier === 2 ? 100 : 20;
 
-  if (/flash-lite|8b-instant|instant/.test(text)) score += 38;
-  else if (/\b(flash|nano|mini|haiku|lite|8b|7b|4b|3b|2b|1b|small|fast|turbo|speed)\b/.test(text)) score += 28;
-  else if (/\b(nemotron-mini|gemma-2-9b|gemma-3-4b|gemma-3-12b|phi-3|phi-4-mini|qwen-?2\.5-7b)\b/.test(text)) score += 26;
+  const isUltraFastGateway =
+    base.includes('groq.com') || base.includes('cerebras') || base.includes('sambanova');
 
-  if (/\b(70b|72b|32b|sonnet|gpt-4o)\b/.test(text) && !text.includes('mini')) score -= 12;
-  if (/\b(opus|o1|o3|o4|r1|qwq|reasoner|thinking|ultra|405b|671b|235b|480b)\b/.test(text)) score -= 36;
-  if (/[-_/]pro\b/.test(text) && !text.includes('flash')) score -= 24;
-  if (params.category === 'turbo') score += 14;
-  if (params.category === 'deep-thought') score -= 20;
-  if (params.modelId === 'auto') score -= 25;
+  if (base.includes('groq.com')) score += 28;
+  else if (base.includes('cerebras')) score += 30;
+  else if (base.includes('sambanova')) score += 24;
+  else if (params.providerId === 'google') score += 22;
+  else if (params.providerId === 'openai') score += 18;
+  else if (params.providerId === 'anthropic') score += 16;
+  else if (base.includes('nvidia.com')) score += 10;
+
+  // Prioritize flagship fast conversational engines
+  if (/\b(gemini-2\.5-flash|gemini-2\.0-flash|gemini-3(\.\d+)?-flash)\b/.test(text) && !text.includes('lite')) {
+    score += 22;
+  } else if (/\b(llama-3\.3-70b|llama-4-scout|llama-4-maverick|gpt-4o-mini|gpt-4\.1-mini|claude-3[._-]5-haiku|claude-haiku)\b/.test(text)) {
+    score += 20;
+  }
+
+  if (/flash-lite|8b-instant|instant/.test(text)) score += 18;
+  else if (/\b(flash|nano|mini|haiku|lite|8b|7b|4b|3b|2b|1b|small|fast|turbo|speed)\b/.test(text)) score += 14;
+  else if (/\b(nemotron-mini|gemma-2-9b|gemma-3-4b|gemma-3-12b|phi-3|phi-4-mini|qwen-?2\.5-7b)\b/.test(text)) score += 12;
+
+  if (/\b(70b|72b|32b|sonnet|gpt-4o)\b/.test(text) && !text.includes('mini') && !isUltraFastGateway) score -= 8;
+  if (/\b(opus|o1|o3|o4|r1|qwq|reasoner|thinking|ultra|405b|671b|235b|480b)\b/.test(text)) score -= 24;
+  if (/[-_/]pro\b/.test(text) && !text.includes('flash')) score -= 14;
+  if (params.category === 'turbo') score += 10;
+  if (params.category === 'deep-thought') score -= 14;
+  if (params.modelId === 'auto') score -= 40;
 
   return score;
 }
@@ -187,8 +277,10 @@ export function computeTaskScores(params: {
   const text = `${params.modelId} ${params.modelName || ''}`.toLowerCase();
   const ctxBonus = Math.min(18, Math.floor((params.contextWindow || 32000) / 32000) * 4);
   const speedScore = scoreCandidateForSpeed(params);
+  const qualityTier = getModelQualityTier(params.modelId, params.modelName || '');
+  const tierOffset = qualityTier === 1 ? 180 : qualityTier === 2 ? 70 : 0;
 
-  let researchScore = 40 + ctxBonus;
+  let researchScore = 40 + tierOffset + ctxBonus;
   if (params.category === 'deep-thought') researchScore += 32;
   if (params.supportsReasoning) researchScore += 18;
   if (/\b(opus|o3|o1|o4|deepseek-r1|r1|qwq|thinking|reasoner|ultra)\b/.test(text)) researchScore += 30;
@@ -200,7 +292,7 @@ export function computeTaskScores(params: {
     researchScore -= 22;
   }
 
-  let documentationScore = 45 + ctxBonus;
+  let documentationScore = 45 + tierOffset + ctxBonus;
   if (/\b(claude|sonnet|gpt-4o|gemini-2\.5-pro|gemini-2\.5-flash|llama-3\.3-70b|qwen-2\.5-72b|mistral-large|command-r)\b/.test(text)) {
     documentationScore += 28;
   }
@@ -209,7 +301,7 @@ export function computeTaskScores(params: {
   if (/\b(8b|7b|4b|3b|1b|nano)\b/.test(text)) documentationScore -= 14;
   if (/\b(r1|qwq|o1|o3)\b/.test(text)) documentationScore -= 6;
 
-  let codingScore = 45 + Math.floor(ctxBonus * 0.6);
+  let codingScore = 45 + tierOffset + Math.floor(ctxBonus * 0.6);
   if (/\b(coder|codestral|codellama|starcoder|deepseek-v3|deepseek-r1|sonnet|claude-3\.5|claude-sonnet|gpt-4o|o3-mini|qwen-2\.5-coder|llama-3\.3-70b|gemini-2\.5-pro)\b/.test(text)) {
     codingScore += 30;
   }
@@ -410,7 +502,7 @@ export async function checkKeyPaidAccess(
         ? `${baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/auth/key`
         : 'https://openrouter.ai/api/v1/auth/key';
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 3000);
+      const timer = setTimeout(() => controller.abort(), 900);
       const resp = await fetch(endpoint, {
         headers: { Authorization: `Bearer ${cleanSecret}` },
         signal: controller.signal,
@@ -445,121 +537,145 @@ export async function collectAllModelCandidates(
   resolveKeySecret: (entry: ApiKeyEntry) => Promise<string | null>,
   signal?: AbortSignal
 ): Promise<RoutedCandidate[]> {
-  const dbProviders = getProviders();
-  const candidates: RoutedCandidate[] = [];
-  const seenKeyModel = new Set<string>();
+  const keysSig = allKeys.map(k => `${k.id}:${k.providerId}:${k.keyName}`).join('|') + `|env:${Boolean(process.env.GEMINI_API_KEY)}`;
+  if (
+    cachedPoolEntry &&
+    cachedPoolEntry.keysSig === keysSig &&
+    Date.now() - cachedPoolEntry.fetchedAt < CANDIDATE_POOL_TTL_MS &&
+    cachedPoolEntry.candidates.length > 0
+  ) {
+    return cachedPoolEntry.candidates.filter(c => !isModelExhausted(c.keyId, c.modelId));
+  }
 
-  const effectiveEntries: Array<{ entry: ApiKeyEntry; secret: string }> = [];
-  for (const kEntry of allKeys) {
-    if (signal?.aborted) break;
-    const secret = await resolveKeySecret(kEntry);
-    if (secret) {
-      effectiveEntries.push({ entry: kEntry, secret });
+  if (inFlightPoolPromise) {
+    const shared = await inFlightPoolPromise;
+    return shared.filter(c => !isModelExhausted(c.keyId, c.modelId));
+  }
+
+  const runDiscovery = async (): Promise<RoutedCandidate[]> => {
+    const dbProviders = getProviders();
+    const candidates: RoutedCandidate[] = [];
+    const seenKeyModel = new Set<string>();
+
+    const resolvedPairs = await Promise.all(
+      allKeys.map(async kEntry => {
+        const secret = await resolveKeySecret(kEntry).catch(() => null);
+        return secret ? { entry: kEntry, secret } : null;
+      })
+    );
+    const effectiveEntries = resolvedPairs.filter((x): x is { entry: ApiKeyEntry; secret: string } => Boolean(x));
+
+    if (effectiveEntries.length === 0 && process.env.GEMINI_API_KEY) {
+      effectiveEntries.push({
+        entry: {
+          id: 'env-gemini',
+          providerId: 'google',
+          keyName: 'Gemini Env',
+          encryptedKey: '',
+          createdAt: 0,
+          isValid: true,
+        },
+        secret: process.env.GEMINI_API_KEY,
+      });
     }
-  }
 
-  if (effectiveEntries.length === 0 && process.env.GEMINI_API_KEY) {
-    effectiveEntries.push({
-      entry: {
-        id: 'env-gemini',
-        providerId: 'google',
-        keyName: 'Gemini Env',
-        encryptedKey: '',
-        createdAt: 0,
-        isValid: true,
-      },
-      secret: process.env.GEMINI_API_KEY,
-    });
-  }
+    await Promise.all(
+      effectiveEntries.map(async ({ entry, secret }) => {
+        if (signal?.aborted) return;
+        const profile = resolveApiKeyProfile(secret, entry.providerId, entry.keyName);
+        const resolvedProviderId = inferProviderFromApiKey(secret, profile.providerId);
+        const dbProv = findMatchingDbProvider(dbProviders, entry, profile);
 
-  await Promise.all(
-    effectiveEntries.map(async ({ entry, secret }) => {
-      if (signal?.aborted) return;
-      const profile = resolveApiKeyProfile(secret, entry.providerId, entry.keyName);
-      const resolvedProviderId = inferProviderFromApiKey(secret, profile.providerId);
-      const dbProv = findMatchingDbProvider(dbProviders, entry, profile);
-
-      let rawModels: any[] = [];
-      if (dbProv?.models && dbProv.models.length > 0) {
-        rawModels = dbProv.models;
-      } else {
-        const isFreeLlm = secret.trim().startsWith('freellma');
-        if (!isFreeLlm) {
-          try {
-            const inst =
-              (dbProv ? providerManager.getProvider(dbProv.id) : undefined) ||
-              providerManager.getProviderForKeyProfile(resolvedProviderId, secret);
-            if (inst) {
-              inst.updateConfig({
-                apiKey: secret,
-                ...(profile.baseUrl ? { baseUrl: profile.baseUrl } : {}),
-              });
-              const fetched = await Promise.race<any[]>([
-                inst.listModels(),
-                new Promise<any[]>(resolve => setTimeout(() => resolve([]), DISCOVERY_TIMEOUT_MS)),
-              ]);
-              if (Array.isArray(fetched) && fetched.length > 0) {
-                rawModels = fetched;
-                if (dbProv) {
-                  try {
-                    updateProvider(dbProv.id, { models: fetched });
-                  } catch {}
+        let rawModels: any[] = [];
+        if (dbProv?.models && dbProv.models.length > 0) {
+          rawModels = dbProv.models;
+        } else {
+          const isFreeLlm = secret.trim().startsWith('freellma');
+          if (!isFreeLlm && (profile.baseUrl || resolvedProviderId !== 'custom')) {
+            try {
+              const inst =
+                (dbProv ? providerManager.getProvider(dbProv.id) : undefined) ||
+                providerManager.getProviderForKeyProfile(resolvedProviderId, secret);
+              if (inst) {
+                inst.updateConfig({
+                  apiKey: secret,
+                  ...(profile.baseUrl ? { baseUrl: profile.baseUrl } : {}),
+                });
+                const fetched = await Promise.race<any[]>([
+                  inst.listModels(),
+                  new Promise<any[]>(resolve => setTimeout(() => resolve([]), DISCOVERY_TIMEOUT_MS)),
+                ]);
+                if (Array.isArray(fetched) && fetched.length > 0) {
+                  rawModels = fetched;
+                  if (dbProv) {
+                    try {
+                      updateProvider(dbProv.id, { models: fetched });
+                    } catch {}
+                  }
                 }
               }
-            }
-          } catch {}
+            } catch {}
+          }
         }
-      }
 
-      if (rawModels.length === 0) {
-        rawModels = getFallbackModelsForProvider(resolvedProviderId, profile.baseUrl, profile.defaultModel);
-      }
+        if (rawModels.length === 0) {
+          rawModels = getFallbackModelsForProvider(resolvedProviderId, profile.baseUrl, profile.defaultModel);
+        }
 
-      const keyAllowsPaid = await checkKeyPaidAccess(resolvedProviderId, secret, profile.baseUrl);
+        const keyAllowsPaid = await checkKeyPaidAccess(resolvedProviderId, secret, profile.baseUrl);
 
-      for (const m of rawModels) {
-        const mId = String(m?.id || '').trim();
-        if (!mId) continue;
-        if (isNonChatUtilityModel(mId, m?.name || '')) continue;
+        for (const m of rawModels) {
+          const mId = String(m?.id || '').trim();
+          if (!mId) continue;
+          if (m?.isAvailable === false || m?.available === false) continue;
+          if (isNonChatUtilityModel(mId, m?.name || '')) continue;
 
-        const dedupeKey = modelKey(entry.id, mId);
-        if (seenKeyModel.has(dedupeKey)) continue;
-        seenKeyModel.add(dedupeKey);
+          const dedupeKey = modelKey(entry.id, mId);
+          if (seenKeyModel.has(dedupeKey)) continue;
+          seenKeyModel.add(dedupeKey);
 
-        if (isModelExhausted(entry.id, mId)) continue;
+          const resolvedTier = m?.tier || inferModelTier(m, profile, secret);
+          if (resolvedTier === 'paid' && !keyAllowsPaid) continue;
 
-        const resolvedTier = m?.tier || inferModelTier(m, profile, secret);
-        if (resolvedTier === 'paid' && !keyAllowsPaid) continue;
+          const category = classifyModelCategory(m);
+          const scores = computeTaskScores({
+            modelId: mId,
+            modelName: m?.name,
+            providerId: resolvedProviderId,
+            baseUrl: profile.baseUrl,
+            category,
+            supportsReasoning: m?.supportsReasoning,
+            contextWindow: m?.contextWindow,
+          });
 
-        const category = classifyModelCategory(m);
-        const scores = computeTaskScores({
-          modelId: mId,
-          modelName: m?.name,
-          providerId: resolvedProviderId,
-          baseUrl: profile.baseUrl,
-          category,
-          supportsReasoning: m?.supportsReasoning,
-          contextWindow: m?.contextWindow,
-        });
+          candidates.push({
+            keyId: entry.id,
+            keyName: entry.keyName || profile.displayName,
+            keySecret: secret,
+            providerId: resolvedProviderId,
+            providerDisplayName: entry.keyName || profile.displayName,
+            modelId: mId,
+            modelName: m?.name || mId,
+            category,
+            tier: resolvedTier,
+            contextWindow: m?.contextWindow || 32000,
+            ...scores,
+          });
+        }
+      })
+    );
 
-        candidates.push({
-          keyId: entry.id,
-          keyName: entry.keyName || profile.displayName,
-          keySecret: secret,
-          providerId: resolvedProviderId,
-          providerDisplayName: entry.keyName || profile.displayName,
-          modelId: mId,
-          modelName: m?.name || mId,
-          category,
-          tier: resolvedTier,
-          contextWindow: m?.contextWindow || 32000,
-          ...scores,
-        });
-      }
-    })
-  );
+    if (candidates.length > 0) {
+      cachedPoolEntry = { keysSig, fetchedAt: Date.now(), candidates };
+    }
+    return candidates;
+  };
 
-  return candidates;
+  inFlightPoolPromise = runDiscovery().finally(() => {
+    inFlightPoolPromise = null;
+  });
+  const allCandidates = await inFlightPoolPromise;
+  return allCandidates.filter(c => !isModelExhausted(c.keyId, c.modelId));
 }
 
 export function getOverviewerCandidates(pool: RoutedCandidate[]): RoutedCandidate[] {

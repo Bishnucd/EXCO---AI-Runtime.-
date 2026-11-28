@@ -40,7 +40,16 @@ function isSafeUrl(raw: string): boolean {
 export function sanitizeHtml(dirtyHtml: string): string {
   if (!dirtyHtml) return '';
   if (typeof DOMParser === 'undefined') {
-    return dirtyHtml.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '');
+    const blocked = Array.from(BLOCKED_TAGS).join('|');
+    return dirtyHtml
+      .replace(new RegExp(`<(${blocked})\\b[\\s\\S]*?<\\/\\1>`, 'gi'), '')
+      .replace(new RegExp(`<(${blocked})\\b[^>]*\\/?>`, 'gi'), '')
+      .replace(/\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+      .replace(/\s+srcdoc\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+      .replace(/(href|src|xlink:href|action|formaction|poster)\s*=\s*(["'])([\s\S]*?)\2/gi, (full, _attr, _q, val) => {
+        return isSafeUrl(val) ? full : '';
+      })
+      .replace(/<a\b(?![^>]*\brel=)([^>]*)>/gi, '<a rel="noopener noreferrer"$1>');
   }
 
   const doc = new DOMParser().parseFromString(dirtyHtml, 'text/html');

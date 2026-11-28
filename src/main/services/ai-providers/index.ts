@@ -56,9 +56,17 @@ export class ProviderManager {
     return undefined;
   }
 
-  getProviderForKeyProfile(providerType: string, keySecret?: string): BaseAIProvider | undefined {
+  getProviderForKeyProfile(providerType: string, keySecret?: string, keyName?: string): BaseAIProvider | undefined {
+    if (keyName) {
+      const targetName = keyName.trim().toLowerCase();
+      for (const p of this.providers.values()) {
+        if (p.getName().trim().toLowerCase() === targetName) {
+          return p;
+        }
+      }
+    }
     if (keySecret) {
-      const profile = resolveApiKeyProfile(keySecret, providerType);
+      const profile = resolveApiKeyProfile(keySecret, providerType, keyName);
       const targetBase = profile.baseUrl.trim().replace(/\/+$/, '').toLowerCase();
       if (targetBase) {
         for (const p of this.providers.values()) {
@@ -68,13 +76,17 @@ export class ProviderManager {
           }
         }
       }
-      if (profile.displayName) {
+      if (profile.displayName && profile.displayName !== 'Custom API') {
         for (const p of this.providers.values()) {
           if (p.getName().toLowerCase() === profile.displayName.toLowerCase()) {
             return p;
           }
         }
       }
+    }
+    if (providerType === 'custom' && keyName) {
+      // Never leak an unrelated custom endpoint (e.g. "run crate") to another custom key
+      return this.getProvider('custom');
     }
     return this.getConfiguredProviderByType(providerType) || this.getProvider(providerType);
   }

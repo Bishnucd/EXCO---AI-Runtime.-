@@ -316,6 +316,8 @@ export function ConfigToolDrawer({ activeTool, onClose }: ConfigToolDrawerProps)
   };
 
   const [validatingKey, setValidatingKey] = useState<string | null>(null);
+  const [deletingKeyIds, setDeletingKeyIds] = useState<Record<string, boolean>>({});
+  const [keyValidationResults, setKeyValidationResults] = useState<Record<string, { valid: boolean; message: string }>>({});
   const [showMcpModal, setShowMcpModal] = useState(false);
   const [editingMcpId, setEditingMcpId] = useState<string | null>(null);
   const [mcpModalTab, setMcpModalTab] = useState<'guided' | 'json'>('guided');
@@ -484,9 +486,28 @@ export function ConfigToolDrawer({ activeTool, onClose }: ConfigToolDrawerProps)
     }
   }, [dailySnapshot]);
 
+  const activeToolRef = React.useRef(activeTool);
+  activeToolRef.current = activeTool;
+  const overviewDirtyRef = React.useRef(false);
+
   useEffect(() => {
-    syncOverviewBenchmarks(false);
-    const onKeysChange = () => syncOverviewBenchmarks(false);
+    if (activeTool === 'overview') {
+      syncOverviewBenchmarks(false);
+      overviewDirtyRef.current = false;
+    } else {
+      overviewDirtyRef.current = true;
+    }
+  }, [activeTool]);
+
+  useEffect(() => {
+    const onKeysChange = () => {
+      if (activeToolRef.current === 'overview') {
+        syncOverviewBenchmarks(false);
+        overviewDirtyRef.current = false;
+      } else {
+        overviewDirtyRef.current = true;
+      }
+    };
     window.addEventListener('exco:keys-updated', onKeysChange);
     return () => window.removeEventListener('exco:keys-updated', onKeysChange);
   }, []);
@@ -615,26 +636,95 @@ export function ConfigToolDrawer({ activeTool, onClose }: ConfigToolDrawerProps)
   };
 
   const handleDeleteApiKey = async (id: string) => {
+    if (deletingKeyIds[id]) return;
     if (!requestInlineConfirm(`key:${id}`)) return;
+    const removedKey = apiKeys.find(k => k.id === id);
+    setDeletingKeyIds(prev => ({ ...prev, [id]: true }));
+    setApiKeys(prev => prev.filter(k => k.id !== id));
+    setKeyValidationResults(prev => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setCustomLists(prev => {
+      const hasMatch = (prev['api-keys'] || []).some(l => l.itemIds.includes(id));
+      if (!hasMatch) return prev;
+      const next = {
+        ...prev,
+        'api-keys': (prev['api-keys'] || []).map(l => ({ ...l, itemIds: l.itemIds.filter(itemId => itemId !== id) })),
+      };
+      saveCustomLists(next);
+      return next;
+    });
     try {
       await window.exco.keys.delete(id);
-      await loadApiKeys();
       window.dispatchEvent(new CustomEvent('exco:keys-updated'));
-      showNotice('success', 'API key deleted.');
+      showNotice('success', `Deleted API key${removedKey?.keyName ? ` "${removedKey.keyName}"` : ''}.`);
     } catch (error) {
       console.error('Failed to delete API key:', error);
+      await loadApiKeys();
       showNotice('error', 'Failed to delete API key.');
+    } finally {
+      setDeletingKeyIds(prev => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+    }
+  };
+
+  const handleCleanInvalidApiKeys = async () => {
+    const invalidKeys = apiKeys.filter(
+      k => keyValidationResults[k.id]?.valid === false || (!k.isValid && Boolean(k.lastValidated))
+    );
+    if (invalidKeys.length === 0) return;
+    if (!requestInlineConfirm('key:clean-invalid')) return;
+    const ids = new Set(invalidKeys.map(k => k.id));
+    setApiKeys(prev => prev.filter(k => !ids.has(k.id)));
+    setKeyValidationResults(prev => {
+      const next = { ...prev };
+      for (const id of ids) delete next[id];
+      return next;
+    });
+    try {
+      await Promise.all(invalidKeys.map(k => window.exco.keys.delete(k.id)));
+      window.dispatchEvent(new CustomEvent('exco:keys-updated'));
+      showNotice('success', `Removed ${invalidKeys.length} invalid API key${invalidKeys.length === 1 ? '' : 's'}.`);
+    } catch (error) {
+      console.error('Failed to clean invalid API keys:', error);
+      await loadApiKeys();
+      showNotice('error', 'Failed to remove some invalid API keys.');
     }
   };
 
   const handleValidateApiKey = async (id: string) => {
     setValidatingKey(id);
+    setKeyValidationResults(prev => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
     try {
       const result = await window.exco.keys.validate(id);
-      showNotice(result.valid ? 'success' : 'error', result.valid ? 'API key is valid.' : `Invalid key: ${result.error}`);
+      const valid = Boolean(result?.valid);
+      setKeyValidationResults(prev => ({
+        ...prev,
+        [id]: {
+          valid,
+          message: valid ? 'Valid key' : result?.error || 'Invalid or unauthorized key',
+        },
+      }));
+      await loadApiKeys();
     } catch (error) {
       console.error('Failed to validate key:', error);
-      showNotice('error', 'Failed to validate API key.');
+      setKeyValidationResults(prev => ({
+        ...prev,
+        [id]: {
+          valid: false,
+          message: error instanceof Error ? error.message : 'Validation check failed',
+        },
+      }));
     } finally {
       setValidatingKey(null);
     }
@@ -1881,9 +1971,11 @@ export function ConfigToolDrawer({ activeTool, onClose }: ConfigToolDrawerProps)
                       setTestingProviderId(provider.id);
                       try {
                         const res = await window.exco.providers.test(provider.id);
+                        await loadProviders();
+                        window.dispatchEvent(new CustomEvent('exco:keys-updated'));
                         showNotice(
                           res?.success ? 'success' : 'error',
-                          res?.success ? `${provider.name} is reachable!` : `Connection check failed: ${res?.error || 'Unable to reach endpoint'}`
+                          res?.success ? `${provider.name} is reachable — models refreshed.` : `Connection check failed: ${res?.error || 'Unable to reach endpoint'}`
                         );
                       } finally {
                         setTestingProviderId(null);
@@ -2057,6 +2149,36 @@ export function ConfigToolDrawer({ activeTool, onClose }: ConfigToolDrawerProps)
       </div>
 
       <div className="flex items-center gap-2 flex-shrink-0">
+        {keyValidationResults[key.id] && (
+          <div
+            className={cn(
+              'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-xs font-medium shadow-sm max-w-[230px]',
+              keyValidationResults[key.id].valid
+                ? 'bg-emerald-500/15 border-emerald-500/35 text-emerald-400'
+                : 'bg-red-500/15 border-red-500/35 text-red-400'
+            )}
+            title={keyValidationResults[key.id].message}
+          >
+            <span className="truncate">
+              {keyValidationResults[key.id].valid ? '✓ ' : '✕ '}
+              {keyValidationResults[key.id].message}
+            </span>
+            <button
+              type="button"
+              onClick={() =>
+                setKeyValidationResults(prev => {
+                  const next = { ...prev };
+                  delete next[key.id];
+                  return next;
+                })
+              }
+              className="opacity-70 hover:opacity-100 flex-shrink-0"
+              aria-label="Dismiss validation result"
+            >
+              <X className="w-3 h-3" />
+            </button>
+          </div>
+        )}
         <button
           onClick={() => handleValidateApiKey(key.id)}
           disabled={validatingKey === key.id}
@@ -2072,10 +2194,19 @@ export function ConfigToolDrawer({ activeTool, onClose }: ConfigToolDrawerProps)
           )}
         </button>
         <button
+          type="button"
           onClick={() => handleDeleteApiKey(key.id)}
-          className="p-2 text-[rgb(var(--color-error))] hover:bg-[rgb(var(--color-error))]/10 rounded"
+          disabled={Boolean(deletingKeyIds[key.id])}
+          className={cn(
+            'p-2 rounded transition-colors flex-shrink-0',
+            confirmTargetId === `key:${key.id}`
+              ? 'bg-red-500 text-white px-2.5 text-xs font-medium'
+              : 'text-[rgb(var(--color-error))] hover:bg-[rgb(var(--color-error))]/10',
+            deletingKeyIds[key.id] && 'opacity-50 cursor-wait'
+          )}
+          title={confirmTargetId === `key:${key.id}` ? 'Click again to confirm delete' : 'Delete API key'}
         >
-          <Trash2 className="w-4 h-4" />
+          {confirmTargetId === `key:${key.id}` ? 'Confirm' : <Trash2 className="w-4 h-4" />}
         </button>
       </div>
     </div>
@@ -2084,6 +2215,9 @@ export function ConfigToolDrawer({ activeTool, onClose }: ConfigToolDrawerProps)
 
   const renderApiKeysSection = () => {
     const detectedProviders = Array.from(new Set(apiKeys.map(k => getProviderDisplayName(k.providerId))));
+    const invalidKeyCount = apiKeys.filter(
+      k => keyValidationResults[k.id]?.valid === false || (!k.isValid && Boolean(k.lastValidated))
+    ).length;
     const keyCardsById = new Map<string, React.ReactNode>(apiKeys.map(k => [k.id, renderApiKeyCard(k)]));
     return (
       <div className="space-y-4">
@@ -2097,6 +2231,26 @@ export function ConfigToolDrawer({ activeTool, onClose }: ConfigToolDrawerProps)
             />
           </div>
           <div className="flex items-center gap-2 flex-shrink-0">
+            {invalidKeyCount > 0 && (
+              <button
+                type="button"
+                onClick={handleCleanInvalidApiKeys}
+                className={cn(
+                  'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border whitespace-nowrap transition-colors',
+                  confirmTargetId === 'key:clean-invalid'
+                    ? 'bg-red-500 border-red-500 text-white'
+                    : 'border-red-500/40 text-red-400 hover:bg-red-500/10'
+                )}
+                title="Remove all API keys that failed validation"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>
+                  {confirmTargetId === 'key:clean-invalid'
+                    ? `Confirm Clean (${invalidKeyCount})`
+                    : `Clean Invalid (${invalidKeyCount})`}
+                </span>
+              </button>
+            )}
             <button
               type="button"
               onClick={() => setListModal({ scope: 'api-keys', editingList: null })}

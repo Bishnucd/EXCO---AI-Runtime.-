@@ -94,17 +94,25 @@ async function getSecurePassword(service: string, account: string): Promise<stri
 }
 
 async function deleteSecurePassword(service: string, account: string): Promise<boolean> {
+  let deletedFromKeytar = false;
   if (keytar && typeof keytar.deletePassword === 'function') {
     try {
-      return await keytar.deletePassword(service, account);
+      deletedFromKeytar = await keytar.deletePassword(service, account);
     } catch {
-      // Fallback below
+      // Fallback cleanup below
     }
   }
-  const store = loadFallbackStore();
-  delete store[`${service}:${account}`];
-  saveFallbackStore(store);
-  return true;
+  try {
+    const store = loadFallbackStore();
+    const compositeKey = `${service}:${account}`;
+    if (Object.prototype.hasOwnProperty.call(store, compositeKey)) {
+      delete store[compositeKey];
+      saveFallbackStore(store);
+    }
+  } catch {
+    // Do not block key deletion if OS safeStorage fallback cannot be written
+  }
+  return deletedFromKeytar || true;
 }
 
 // ============================================================================

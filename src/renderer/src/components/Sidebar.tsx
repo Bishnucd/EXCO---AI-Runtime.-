@@ -72,6 +72,8 @@ export function Sidebar({
     toggleProjectExpanded,
     renameProject,
     deleteProject,
+    setProjectConversationId,
+    removeProjectConversationId,
     createFileInDir,
     createFolderInDir,
     renameFsEntry,
@@ -80,6 +82,7 @@ export function Sidebar({
   const globalFilter = useThemeStore(state => state.globalFilter);
 
   const [conversations, setConversations] = useState<any[]>([]);
+  const [workConversations, setWorkConversations] = useState<any[]>([]);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState('');
   const [pendingDeleteConv, setPendingDeleteConv] = useState<{ id: string; title: string } | null>(null);
@@ -100,18 +103,60 @@ export function Sidebar({
   const loadConversations = async () => {
     try {
       const convs = await window.exco.chat.listConversations();
-      setConversations((convs || []).filter((c: any) => !String(c?.title || '').startsWith('[Work] ')));
+      setConversations(
+        (convs || []).filter((c: any) => {
+          const t = String(c?.title || '');
+          return !t.startsWith('[Work] ') && !t.startsWith('Work: ');
+        })
+      );
     } catch (err) {
       console.error('Failed to load conversations:', err);
     }
   };
 
+  const loadWorkConversations = async () => {
+    try {
+      if (window.exco.work?.listConversations) {
+        const workConvs = await window.exco.work.listConversations();
+        setWorkConversations(Array.isArray(workConvs) ? workConvs : []);
+        return;
+      }
+      // Fallback if Electron main/preload has not been restarted yet in dev mode
+      const allConvs = await window.exco.chat.listConversations();
+      setWorkConversations(
+        (allConvs || [])
+          .filter((c: any) => {
+            const t = String(c?.title || '');
+            return t.startsWith('[Work] ') || t.startsWith('Work: ');
+          })
+          .map((c: any) => ({
+            ...c,
+            title: String(c.title || '').replace(/^(\[Work\]\s*|Work:\s*)/i, '') || 'Work Chat',
+          }))
+      );
+    } catch (err) {
+      console.error('Failed to load workspace conversations:', err);
+    }
+  };
+
   useEffect(() => {
     loadConversations();
+    loadWorkConversations();
     const handleUpdate = () => loadConversations();
+    const handleWorkUpdate = () => loadWorkConversations();
     window.addEventListener('exco:conversations-updated', handleUpdate);
-    return () => window.removeEventListener('exco:conversations-updated', handleUpdate);
+    window.addEventListener('exco:work-conversations-updated', handleWorkUpdate);
+    return () => {
+      window.removeEventListener('exco:conversations-updated', handleUpdate);
+      window.removeEventListener('exco:work-conversations-updated', handleWorkUpdate);
+    };
   }, []);
+
+  useEffect(() => {
+    if (isWorkActive || mode === 'work') {
+      loadWorkConversations();
+    }
+  }, [isWorkActive, mode, activeProjectId, projects.length]);
 
   const handleModeClick = (newMode: 'chatbot' | 'work') => {
     onModeChange(newMode);
@@ -755,9 +800,109 @@ export function Sidebar({
                       </div>
                     )}
 
-                    {/* Collapsible Project Dropdown Content -> Folder -> Subfolders -> Files */}
-                    {isProjectOpen && (
-                      <div className="pl-3 ml-2 border-l border-[rgb(var(--color-border))]/70 space-y-1 py-0.5">
+                    {/* Collapsible Project Dropdown Content -> Project Chats + Folders Tree */}
+                    {isProjectOpen && (() => {
+                      const localConvId = typeof window !== 'undefined' ? localStorage.getItem(`exco:work-conv:${proj.id}`) : null;
+                      const projConvIdSet = new Set<string>([
+                        ...(proj.conversationId ? [proj.conversationId] : []),
+                        ...(Array.isArray(proj.conversationIds) ? proj.conversationIds : []),
+                        ...(localConvId ? [localConvId] : []),
+                      ]);
+                      const projWorkConvs = workConversations.filter(c => projConvIdSet.has(c.id));
+
+                      return (
+                      <div className="pl-3 ml-2 border-l border-[rgb(var(--color-border))]/70 space-y-1.5 py-0.5">
+                        {/* Project Chat History Section (strictly isolated from Chat Mode) */}
+                        <div className="space-y-0.5 pb-1 border-b border-[rgb(var(--color-border))]/50">
+                          <div className="flex items-center justify-between px-1.5 py-0.5">
+                            <span className="text-[10px] font-semibold uppercase tracking-wider text-[rgb(var(--color-foreground-muted))]">
+                              Chats ({projWorkConvs.length})
+                            </span>
+                            <button
+                              type="button"
+                              onClick={async e => {
+                                e.stopPropagation();
+                                localStorage.removeItem(`exco:work-conv:${proj.id}`);
+                                await setProjectConversationId(proj.id, undefined);
+                                await switchProject(proj.id);
+                                onModeChange('work');
+                                navigate('/work');
+                                window.dispatchEvent(
+                                  new CustomEvent('exco:work-select-conversation', {
+                                    detail: { projectId: proj.id, conversationId: undefined },
+                                  })
+                                );
+                              }}
+                              className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-medium text-[rgb(var(--color-primary))] hover:bg-[rgb(var(--color-primary))]/10"
+                              title="Start a new chat inside this project folder"
+                            >
+                              <Plus className="w-3 h-3" />
+                              <span>New Chat</span>
+                            </button>
+                          </div>
+
+                          {projWorkConvs.length === 0 ? (
+                            <p className="px-2 py-0.5 text-[11px] text-[rgb(var(--color-foreground-muted))] italic">
+                              No chats yet in this folder
+                            </p>
+                          ) : (
+                            projWorkConvs.map(wc => {
+                              const isCurrentChat = isActive && proj.conversationId === wc.id;
+                              return (
+                                <div
+                                  key={wc.id}
+                                  onClick={async e => {
+                                    e.stopPropagation();
+                                    localStorage.setItem(`exco:work-conv:${proj.id}`, wc.id);
+                                    await setProjectConversationId(proj.id, wc.id);
+                                    await switchProject(proj.id);
+                                    onModeChange('work');
+                                    navigate('/work');
+                                    window.dispatchEvent(
+                                      new CustomEvent('exco:work-select-conversation', {
+                                        detail: { projectId: proj.id, conversationId: wc.id },
+                                      })
+                                    );
+                                  }}
+                                  className={cn(
+                                    'group flex items-center justify-between gap-1 px-2 py-1 rounded-md cursor-pointer text-xs transition-colors',
+                                    isCurrentChat
+                                      ? 'bg-[rgb(var(--color-primary))]/15 text-[rgb(var(--color-foreground))] font-medium'
+                                      : 'text-[rgb(var(--color-foreground-muted))] hover:bg-[rgb(var(--color-surface-hover))] hover:text-[rgb(var(--color-foreground))]'
+                                  )}
+                                  title={wc.title}
+                                >
+                                  <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                                    <MessageSquare className="w-3.5 h-3.5 flex-shrink-0 opacity-75" />
+                                    <span className="truncate text-[11px]">{wc.title || 'Work Chat'}</span>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={async e => {
+                                      e.stopPropagation();
+                                      if (localStorage.getItem(`exco:work-conv:${proj.id}`) === wc.id) {
+                                        localStorage.removeItem(`exco:work-conv:${proj.id}`);
+                                      }
+                                      await removeProjectConversationId(proj.id, wc.id);
+                                      await window.exco.chat.cancelStream(wc.id).catch(() => {});
+                                      await window.exco.chat.deleteConversation(wc.id).catch(() => {});
+                                      setWorkConversations(prev => prev.filter(item => item.id !== wc.id));
+                                      window.dispatchEvent(
+                                        new CustomEvent('exco:work-conv-deleted', { detail: { projectId: proj.id, conversationId: wc.id } })
+                                      );
+                                      window.dispatchEvent(new CustomEvent('exco:work-conversations-updated'));
+                                    }}
+                                    className="p-0.5 rounded opacity-0 group-hover:opacity-100 text-slate-500 hover:text-red-500 hover:bg-red-500/10 transition-all"
+                                    title="Delete project chat"
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              );
+                            })
+                          )}
+                        </div>
+
                         {folders.length === 0 ? (
                           <p className="px-2 py-1 text-[11px] text-[rgb(var(--color-foreground-muted))] italic">
                             Use Select Folder in the chat session to attach a folder.
@@ -824,7 +969,8 @@ export function Sidebar({
                           })
                         )}
                       </div>
-                    )}
+                      );
+                    })()}
                   </div>
                 );
               })

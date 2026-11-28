@@ -64,7 +64,7 @@ export class AnthropicProvider extends BaseAIProvider {
   }
 
   getId(): string {
-    return 'anthropic';
+    return this.provider.id || 'anthropic';
   }
 
   getName(): string {

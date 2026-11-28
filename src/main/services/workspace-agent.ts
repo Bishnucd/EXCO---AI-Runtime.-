@@ -27,6 +27,15 @@ import {
   searchActiveSkills,
   loadActiveSkill,
 } from '@main/services/skills-registry';
+import {
+  collectAllModelCandidates,
+  getModelQualityTier,
+  isAuthError,
+  markKeyAuthFailed,
+  markModelExhausted,
+  routeTurnWithOverviewer,
+  type RoutedCandidate,
+} from '@main/services/model-router';
 import { classifyModelCategory, inferProviderFromApiKey, resolveApiKeyProfile, isPathWithin } from '@shared/utils';
 import type { ApiKeyEntry, PermissionLevel, ToolCall } from '@shared/types';
 
@@ -328,8 +337,11 @@ function validateShellCommandWithinWorkspace(command: string, allowedRoots: stri
   if (/(?:^|\s|["'])(\.\.[\\/]){2,}/.test(command) || /(?:^|\s)(?:cd|set-location|sl|pushd)\s+(?:\.\.|[a-z]:[\\/]|[\\/])/i.test(command)) {
     throw new Error(`Command blocked: directory change/traversal outside synced project folders is not allowed.`);
   }
-  const driveMatches = command.match(/[A-Za-z]:[\\/][^\s"'`]+/g) || [];
-  for (const abs of driveMatches) {
+  // Ignore URL schemes (http://, https://, file://, ws://) before scanning for Windows drive paths like C:\
+  const scrubbedUrls = command.replace(/[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'`]+/g, ' ');
+  const driveMatches = scrubbedUrls.match(/(?:^|[\s"'`=,(])([A-Za-z]:[\\/][^\s"'`]+)/g) || [];
+  for (const rawMatch of driveMatches) {
+    const abs = rawMatch.replace(/^[\s"'`=,(]+/, '');
     const clean = abs.replace(/["'`;,)]+$/, '');
     if (!isWithinAnyRoot(path.resolve(clean), allowedRoots)) {
       throw new Error(`Command blocked: referenced path "${clean}" is outside the active project and its synced folders.`);
@@ -360,15 +372,100 @@ async function runCommandTool(allowedRoots: string[], primaryRoot: string, args:
   }
 }
 
-function parseAgentToolCalls(rawText: string): Array<{ tool: AgentToolName; args: Record<string, any>; thought?: string }> | null {
+function escapeControlCharsInJsonStrings(raw: string): string {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (escaped) {
+      out += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      out += ch;
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      out += ch;
+      continue;
+    }
+    if (inString) {
+      if (ch === '\n') {
+        out += '\\n';
+        continue;
+      }
+      if (ch === '\r') {
+        out += '\\r';
+        continue;
+      }
+      if (ch === '\t') {
+        out += '\\t';
+        continue;
+      }
+    }
+    out += ch;
+  }
+  return out;
+}
+
+function tryParseJsonLenient(candidate: string): any | null {
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    try {
+      return JSON.parse(escapeControlCharsInJsonStrings(candidate));
+    } catch {
+      return null;
+    }
+  }
+}
+
+function extractBalancedJsonValues(raw: string): string[] {
+  const results: string[] = [];
+  let inString = false;
+  let escaped = false;
+  let depth = 0;
+  let startIdx = -1;
+
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\' && inString) {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+
+    if (ch === '{' || ch === '[') {
+      if (depth === 0) startIdx = i;
+      depth += 1;
+    } else if (ch === '}' || ch === ']') {
+      if (depth > 0) {
+        depth -= 1;
+        if (depth === 0 && startIdx >= 0) {
+          results.push(raw.slice(startIdx, i + 1));
+          startIdx = -1;
+        }
+      }
+    }
+  }
+  return results;
+}
+
+export function parseAgentToolCalls(rawText: string): Array<{ tool: AgentToolName; args: Record<string, any>; thought?: string }> | null {
   const trimmed = (rawText || '').trim();
   if (!trimmed) return null;
-
-  const candidates: string[] = [trimmed];
-  const fencedMatches = Array.from(trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi));
-  for (const m of fencedMatches) {
-    if (m[1]) candidates.push(m[1].trim());
-  }
 
   const validTools = new Set<string>([
     'list_dir',
@@ -382,41 +479,55 @@ function parseAgentToolCalls(rawText: string): Array<{ tool: AgentToolName; args
     'load_ai_skill',
   ]);
 
-  for (const candidate of candidates) {
-    try {
-      const parsed = JSON.parse(candidate);
-      const list = Array.isArray(parsed) ? parsed : [parsed];
-      const normalized: Array<{ tool: AgentToolName; args: Record<string, any>; thought?: string }> = [];
-      for (const item of list) {
-        if (item && typeof item.tool === 'string' && validTools.has(item.tool)) {
-          normalized.push({
-            tool: item.tool as AgentToolName,
-            args: item.args && typeof item.args === 'object' ? item.args : {},
-            thought: typeof item.thought === 'string' ? item.thought : undefined,
-          });
-        }
+  const toNormalized = (parsed: any): Array<{ tool: AgentToolName; args: Record<string, any>; thought?: string }> => {
+    const list = Array.isArray(parsed) ? parsed : [parsed];
+    const normalized: Array<{ tool: AgentToolName; args: Record<string, any>; thought?: string }> = [];
+    for (const item of list) {
+      if (item && typeof item.tool === 'string' && validTools.has(item.tool)) {
+        normalized.push({
+          tool: item.tool as AgentToolName,
+          args: item.args && typeof item.args === 'object' ? item.args : {},
+          thought: typeof item.thought === 'string' ? item.thought : undefined,
+        });
       }
-      if (normalized.length > 0) return normalized;
-    } catch {
-      // Not clean JSON; try next candidate
     }
+    return normalized;
+  };
+
+  const candidates: string[] = [trimmed];
+  const fencedMatches = Array.from(trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi));
+  for (const m of fencedMatches) {
+    if (m[1]) candidates.push(m[1].trim());
   }
 
-  // Fallback: extract embedded tool call JSON object if model wrote prose + JSON
-  const firstBrace = trimmed.indexOf('{');
-  const lastBrace = trimmed.lastIndexOf('}');
-  if (firstBrace >= 0 && lastBrace > firstBrace) {
-    const sub = trimmed.slice(firstBrace, lastBrace + 1);
-    try {
-      const parsed = JSON.parse(sub);
-      if (parsed && typeof parsed.tool === 'string' && validTools.has(parsed.tool)) {
-        return [{
-          tool: parsed.tool as AgentToolName,
-          args: parsed.args && typeof parsed.args === 'object' ? parsed.args : {},
-          thought: typeof parsed.thought === 'string' ? parsed.thought : undefined,
-        }];
+  for (const candidate of candidates) {
+    const parsed = tryParseJsonLenient(candidate);
+    if (!parsed) continue;
+    const normalized = toNormalized(parsed);
+    if (normalized.length > 0) return normalized;
+  }
+
+  // Fallback: extract one or more balanced JSON values (e.g. prose + JSON or concatenated {...}--{...})
+  const extractedCalls: Array<{ tool: AgentToolName; args: Record<string, any>; thought?: string }> = [];
+  for (const slice of extractBalancedJsonValues(trimmed)) {
+    const parsed = tryParseJsonLenient(slice);
+    if (!parsed) continue;
+    for (const item of toNormalized(parsed)) {
+      extractedCalls.push(item);
+    }
+  }
+  if (extractedCalls.length > 0) return extractedCalls;
+
+  // Recover completed tool objects inside a truncated JSON array "[{...}, {..."
+  if (trimmed.startsWith('[')) {
+    for (const slice of extractBalancedJsonValues(trimmed.slice(1))) {
+      const parsed = tryParseJsonLenient(slice);
+      if (!parsed) continue;
+      for (const item of toNormalized(parsed)) {
+        extractedCalls.push(item);
       }
-    } catch {}
+    }
+    if (extractedCalls.length > 0) return extractedCalls;
   }
 
   return null;
@@ -469,7 +580,7 @@ export async function runWorkspaceAgent(input: RunWorkspaceAgentInput): Promise<
   if (!convId || !getConversation(convId)) {
     const promptPreview = typeof prompt === 'string' ? prompt.trim().slice(0, 48) : 'Workspace Task';
     const created = createConversation({
-      title: `Work: ${promptPreview || path.basename(workspacePath)}`,
+      title: `[Work] ${promptPreview || path.basename(workspacePath)}`,
       modelId: requestedModel || 'auto',
       providerId: requestedProvider || 'default',
     });
@@ -501,37 +612,18 @@ export async function runWorkspaceAgent(input: RunWorkspaceAgentInput): Promise<
     return null;
   };
 
-  const providerKeys: Record<string, string> = {};
-  let providerId = requestedProvider || '';
-  let modelId = requestedModel || '';
+  const runState: ActiveRun = {
+    conversationId: convId,
+    aborted: false,
+    allowAllInRun: accessLevel === 'full-access',
+    abortController: new AbortController(),
+    pendingApprovals: new Map(),
+  };
+  activeRuns.set(runId, runState);
 
-  if (modelId) {
-    const lower = modelId.toLowerCase();
-    if (lower.includes('claude')) providerId = 'anthropic';
-    else if (lower.includes('gpt')) providerId = 'openai';
-    else if (lower.includes('gemini')) providerId = 'google';
-  }
-
-  const selectedKeyEntry = keyId ? allKeys.find(k => k.id === keyId) : undefined;
-  if (selectedKeyEntry) {
-    const secret = await resolveKeySecret(selectedKeyEntry);
-    if (secret) {
-      providerId = inferProviderFromApiKey(secret, selectedKeyEntry.providerId);
-      providerKeys[providerId] = secret;
-    }
-  }
-  for (const kEntry of allKeys) {
-    const secret = await resolveKeySecret(kEntry);
-    if (secret) {
-      const resolved = inferProviderFromApiKey(secret, kEntry.providerId);
-      if (!providerKeys[resolved]) providerKeys[resolved] = secret;
-    }
-  }
-  if (!providerKeys.google && process.env.GEMINI_API_KEY) {
-    providerKeys.google = process.env.GEMINI_API_KEY;
-  }
-
-  if (Object.keys(providerKeys).length === 0) {
+  const pool = await collectAllModelCandidates(allKeys, resolveKeySecret, runState.abortController.signal);
+  if (pool.length === 0) {
+    activeRuns.delete(runId);
     const assistantMessage = createMessage({
       conversationId: convId,
       role: 'assistant',
@@ -544,74 +636,43 @@ export async function runWorkspaceAgent(input: RunWorkspaceAgentInput): Promise<
     return { conversationId: convId, userMessage, assistantMessage, steps: [] };
   }
 
-  if (!providerId || !providerKeys[providerId]) {
-    providerId = Object.keys(providerKeys)[0];
-  }
+  const promptStr = typeof prompt === 'string' ? prompt : '';
+  const decision = await routeTurnWithOverviewer({
+    pool,
+    promptText: promptStr,
+    requestedModel: requestedModel && requestedModel !== 'default' ? requestedModel : 'auto',
+    preferredKeyId: keyId,
+    workflowMode: (workflowMode || 'auto') as any,
+    hasHeavyAttachments: false,
+    hasAnyAttachment: Array.isArray(attachments) && attachments.length > 0,
+    preferredFailover: preferredFailover !== false,
+    signal: runState.abortController.signal,
+    onStatus: (msg) => emitAgentEvent({ runId, type: 'status', message: msg }),
+  });
 
-  const turboChain = [
-    { model: 'gemini-2.5-flash', provider: 'google' },
-    { model: 'gpt-4o-mini', provider: 'openai' },
-    { model: 'claude-3-5-haiku-20241022', provider: 'anthropic' },
-  ];
-  const reasoningChain = [
-    { model: 'gemini-2.5-pro', provider: 'google' },
-    { model: 'claude-sonnet-4-5', provider: 'anthropic' },
-    { model: 'gpt-4o', provider: 'openai' },
-  ];
-  const standardChain = [
-    { model: 'gemini-2.5-flash', provider: 'google' },
-    { model: 'gpt-4o', provider: 'openai' },
-    { model: 'claude-3-5-sonnet-20241022', provider: 'anthropic' },
-  ];
-
-  const isExplicitWorkflow = workflowMode === 'turbo' || workflowMode === 'standard' || workflowMode === 'deep-thought';
-  const effectiveCategory = isExplicitWorkflow
-    ? workflowMode
-    : modelId && modelId !== 'auto' && modelId !== 'default'
-    ? classifyModelCategory({ id: modelId })
-    : 'standard';
-
-  const chain = effectiveCategory === 'deep-thought' ? reasoningChain : effectiveCategory === 'turbo' ? turboChain : standardChain;
-  const availableChain = chain.filter(c => !!providerKeys[c.provider]);
-  let candidates = [
-    ...availableChain.filter(c => c.provider === providerId),
-    ...availableChain.filter(c => c.provider !== providerId),
-  ];
-  if (modelId && modelId !== 'auto' && modelId !== 'default') {
-    const primary = { model: modelId, provider: providerId };
-    const backups = candidates.filter(c => !(c.model === modelId && c.provider === providerId));
-    candidates = preferredFailover ? [primary, ...backups] : [primary];
-  } else if (providerId === 'custom' || providerId === 'openrouter' || providerId === 'ollama') {
-    const keySecret = providerKeys[providerId] || '';
-    const profile = resolveApiKeyProfile(keySecret, providerId);
-    let defaultModel = keySecret.trim().startsWith('freellma') ? 'auto' : profile.defaultModel || 'default';
-    if (!keySecret.trim().startsWith('freellma')) {
-      try {
-        const provInst = providerManager.getProviderForKeyProfile(providerId, keySecret);
-        if (provInst) {
-          provInst.updateConfig({
-            apiKey: keySecret,
-            ...(profile.baseUrl ? { baseUrl: profile.baseUrl } : {}),
-          });
-          const catalog = await provInst.listModels();
-          const picked =
-            catalog.find(m => m.id !== 'auto' && classifyModelCategory(m) === effectiveCategory) ||
-            catalog.find(m => m.id !== 'auto');
-          if (picked?.id) defaultModel = picked.id;
-        }
-      } catch {}
+  // Strictly prioritize Tier 1 Leading models across connected keys in round-robin before Tier 2/3 fallbacks
+  const orderedPool = decision?.candidates || pool;
+  const candidates: RoutedCandidate[] = [];
+  for (const tier of [1, 2, 3] as const) {
+    const tierList = orderedPool.filter(c => getModelQualityTier(c.modelId, c.modelName) === tier);
+    const bucketsByKey = new Map<string, RoutedCandidate[]>();
+    for (const c of tierList) {
+      const list = bucketsByKey.get(c.keyId) || [];
+      list.push(c);
+      bucketsByKey.set(c.keyId, list);
     }
-    candidates = [{ model: defaultModel, provider: providerId }];
+    let addedInPass = true;
+    while (addedInPass) {
+      addedInPass = false;
+      for (const list of bucketsByKey.values()) {
+        const nextCand = list.shift();
+        if (nextCand) {
+          candidates.push(nextCand);
+          addedInPass = true;
+        }
+      }
+    }
   }
-
-  const runState: ActiveRun = {
-    conversationId: convId,
-    aborted: false,
-    allowAllInRun: accessLevel === 'full-access',
-    abortController: new AbortController(),
-    pendingApprovals: new Map(),
-  };
-  activeRuns.set(runId, runState);
 
   const systemPrompt = [
     `You are EXCO Work Agent operating strictly inside the active project's folder sandbox.`,
@@ -626,7 +687,7 @@ export async function runWorkspaceAgent(input: RunWorkspaceAgentInput): Promise<
       : '',
     '',
     'You have real tools to inspect files, search code, write/edit/delete files, and execute shell commands.',
-    'When you want to run a tool step, reply ONLY with a valid JSON object (no surrounding prose) like:',
+    'When you want to run a tool step, reply ONLY with ONE valid JSON tool object (for write_file, create ONE file per step — never batch multiple files into one huge array) and stop right after the closing brace; escape newlines in JSON strings as \\n:',
     '{"thought":"short explanation of why","tool":"read_file","args":{"path":"relative/path.ts"}}',
     'Or a JSON array of up to 3 read-only tool calls when inspecting multiple files in parallel.',
     '',
@@ -657,24 +718,27 @@ export async function runWorkspaceAgent(input: RunWorkspaceAgentInput): Promise<
 
   const executedSteps: WorkspaceAgentStep[] = [];
   let finalReply = '';
-  let usedModel = modelId || 'auto';
-  let usedProvider = providerId;
+  let usedModel = candidates[0]?.modelId || requestedModel || 'auto';
+  let usedProvider = candidates[0]?.providerId || requestedProvider || 'auto';
   let totalTokens: any = undefined;
 
+  const failedAuthKeys = new Set<string>();
   let activeTurnNumber = 1;
   const callModelOnce = async (msgs: Array<{ role: 'user' | 'assistant'; content: any }>) => {
     let lastErr: any;
-    for (let i = 0; i < Math.min(candidates.length, 4); i++) {
+    let attemptsMade = 0;
+    for (let i = 0; i < candidates.length && attemptsMade < 40; i++) {
       if (runState.aborted || runState.abortController.signal.aborted || !getConversation(convId!)) {
         throw new Error('Workspace agent run cancelled');
       }
       const cand = candidates[i];
-      const keySecret = providerKeys[cand.provider];
-      const prov = providerManager.getProviderForKeyProfile(cand.provider, keySecret);
+      if (failedAuthKeys.has(cand.keyId)) continue;
+      attemptsMade += 1;
+      const prov = providerManager.getProviderForKeyProfile(cand.providerId, cand.keySecret, cand.keyName);
       if (!prov) continue;
-      if (keySecret) {
-        const profile = resolveApiKeyProfile(keySecret, cand.provider);
-        const patch: { apiKey: string; baseUrl?: string } = { apiKey: keySecret };
+      if (cand.keySecret) {
+        const profile = resolveApiKeyProfile(cand.keySecret, cand.providerId, cand.keyName);
+        const patch: { apiKey: string; baseUrl?: string } = { apiKey: cand.keySecret };
         if (profile.baseUrl) {
           patch.baseUrl = profile.baseUrl;
         }
@@ -684,21 +748,33 @@ export async function runWorkspaceAgent(input: RunWorkspaceAgentInput): Promise<
       emitAgentEvent({
         runId,
         type: 'status',
-        message: `Interfacing ${cand.provider.toUpperCase()} (${cand.model}) · Step ${activeTurnNumber}...`,
+        message: attemptsMade === 1
+          ? `Interfacing ${cand.providerId.toUpperCase()} (${cand.modelId}) · Step ${activeTurnNumber}...`
+          : `Using ${cand.providerId.toUpperCase()} (${cand.modelId}) · Step ${activeTurnNumber}...`,
       });
+      const attemptCtrl = new AbortController();
+      const onParentAbort = () => attemptCtrl.abort();
+      runState.abortController.signal.addEventListener('abort', onParentAbort, { once: true });
+      let attemptTimedOut = false;
+      const attemptTimer = setTimeout(() => {
+        attemptTimedOut = true;
+        attemptCtrl.abort();
+      }, 28000);
+
       const heartbeat = setInterval(() => {
-        if (runState.aborted || runState.abortController.signal.aborted) return;
+        if (runState.aborted || attemptCtrl.signal.aborted) return;
         const sec = Math.max(1, Math.round((Date.now() - attemptStartedAt) / 1000));
         emitAgentEvent({
           runId,
           type: 'status',
-          message: `Waiting on ${cand.provider.toUpperCase()} (${cand.model}) · Step ${activeTurnNumber} (${sec}s)...`,
+          message: `Waiting on ${cand.providerId.toUpperCase()} (${cand.modelId}) · Step ${activeTurnNumber} (${sec}s)...`,
         });
       }, 1000);
       try {
-        const res = await providerManager.complete(prov.getId(), {
-          model: cand.model,
+        const res = await prov.complete({
+          model: cand.modelId,
           systemPrompt,
+          maxTokens: 16384,
           messages: msgs.map((m, idx) => ({
             id: `agent-msg-${idx}`,
             conversationId: convId!,
@@ -707,22 +783,54 @@ export async function runWorkspaceAgent(input: RunWorkspaceAgentInput): Promise<
             createdAt: Date.now(),
             status: 'complete',
           })) as any,
-          signal: runState.abortController.signal,
+          signal: attemptCtrl.signal,
         });
-        usedModel = res.model || cand.model;
-        usedProvider = cand.provider;
+        const rawContent = (res?.content || '').trim();
+        if (!rawContent) {
+          throw new Error(`Empty output from ${cand.modelId}`);
+        }
+        usedModel = res.model || cand.modelId;
+        usedProvider = cand.providerId;
         if (res.usage) totalTokens = res.usage;
-        return res.content || '';
-      } catch (err) {
+        // Move winning candidate to the front for subsequent tool-loop steps
+        if (i > 0) {
+          candidates.splice(i, 1);
+          candidates.unshift(cand);
+        }
+        return rawContent;
+      } catch (err: any) {
         if (runState.aborted || runState.abortController.signal.aborted) {
           throw err;
         }
-        lastErr = err;
+        const errMsg = attemptTimedOut
+          ? `${cand.modelId} timed out after 28s`
+          : err instanceof Error
+          ? err.message
+          : String(err || 'Provider error');
+        const errMsgL = errMsg.toLowerCase();
+        const isBillingExhausted =
+          errMsgL.includes('add credits') ||
+          errMsgL.includes('insufficient balance') ||
+          errMsgL.includes('insufficient quota') ||
+          errMsgL.includes('payment required') ||
+          errMsgL.includes('402');
+        if (isAuthError(err) || isBillingExhausted) {
+          failedAuthKeys.add(cand.keyId);
+          markKeyAuthFailed(cand.keyId, errMsg);
+        } else {
+          markModelExhausted(cand.keyId, cand.modelId, errMsg);
+        }
+        lastErr = new Error(errMsg);
+        if (preferredFailover === false) {
+          throw lastErr;
+        }
       } finally {
+        clearTimeout(attemptTimer);
         clearInterval(heartbeat);
+        runState.abortController.signal.removeEventListener('abort', onParentAbort);
       }
     }
-    throw lastErr || new Error('All configured AI providers failed');
+    throw lastErr || new Error('All configured AI providers failed or returned empty output');
   };
 
   try {
@@ -744,6 +852,17 @@ export async function runWorkspaceAgent(input: RunWorkspaceAgentInput): Promise<
       const toolCalls = parseAgentToolCalls(modelText);
 
       if (!toolCalls || toolCalls.length === 0) {
+        const looksLikeTruncatedTool =
+          (modelText.trim().startsWith('{') || modelText.trim().startsWith('[')) &&
+          /"tool"\s*:/.test(modelText) &&
+          turn < MAX_TURNS - 2;
+        if (looksLikeTruncatedTool) {
+          scratchHistory.push({
+            role: 'user',
+            content: 'Your previous JSON tool call was truncated before closing. Emit ONLY ONE valid smaller JSON tool call object now (create one file per step).',
+          });
+          continue;
+        }
         finalReply = modelText.trim() || 'Completed.';
         break;
       }

@@ -27,6 +27,7 @@ import {
   Wand2,
   Sparkles,
   FileText,
+  AudioLines,
 } from 'lucide-react';
 import { marked } from 'marked';
 import {
@@ -37,11 +38,16 @@ import {
   getProviderDisplayName,
   AUTO_WORKFLOW_INFO,
   WORKFLOW_CATEGORIES,
+  parseVoiceSession,
   type ModelCategory,
   type WorkflowSelection,
 } from '@shared/utils';
+import type { VoiceSessionPayload } from '@shared/types';
 import { VisualOverlay } from '../components/VisualOverlay';
 import { InfoTip } from '../components/InfoTip';
+import { VoiceChatPopup } from '../components/VoiceChatPopup';
+import { VoiceTranscriptCard } from '../components/VoiceTranscriptCard';
+import { useVoiceSettingsStore } from '../stores/voiceSettingsStore';
 import { useDismissOutside } from '../hooks/useDismissOutside';
 import { useThemeStore, getSegmentStyle, resolveActiveWallpaper } from '../stores/themeStore';
 import { buildActiveSkillContext } from '../stores/skillsStore';
@@ -109,6 +115,7 @@ const ChatbotMode: React.FC = () => {
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [voiceChatActive, setVoiceChatActive] = useState(false);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [attachedFiles, setAttachedFiles] = useState<Array<{
     id: string;
@@ -507,9 +514,12 @@ const ChatbotMode: React.FC = () => {
 
       setIsTranscribing(true);
       try {
+        const voiceCfg = useVoiceSettingsStore.getState();
         const res = await window.exco.chat.transcribeAudio({
           wavBase64,
           keyId: selectedKeyId || undefined,
+          preferredEngine: voiceCfg.speechEngine,
+          language: voiceCfg.speechLanguage || 'en',
         });
         if (res?.text?.trim()) {
           const cleanText = res.text.trim();
@@ -1017,6 +1027,18 @@ const ChatbotMode: React.FC = () => {
           )}
 
           {messages.map((message) => {
+            const voiceSession = parseVoiceSession(message.content);
+            if (voiceSession) {
+              return (
+                <VoiceTranscriptCard
+                  key={message.id}
+                  session={voiceSession}
+                  createdAt={message.createdAt}
+                  bubbleStyle={getSegmentStyle(assistantBubble)}
+                />
+              );
+            }
+
             if (message.role === 'system') {
               return (
                 <div key={message.id} className="flex justify-center">
@@ -1198,6 +1220,43 @@ const ChatbotMode: React.FC = () => {
           <div ref={messagesEndRef} />
         </div>
       </div>
+
+      {/* Live Bidirectional Voice Chat Pop-up (isolated from main chat until ended) */}
+      {voiceChatActive && (
+        <VoiceChatPopup
+          conversationId={conversationId}
+          selectedModel={selectedModel}
+          selectedKeyId={selectedKeyId}
+          preferredFailover={preferredFailover}
+          workflowMode={workflowMode}
+          onCancelEmpty={() => setVoiceChatActive(false)}
+          onEndSession={async (payload: VoiceSessionPayload) => {
+            try {
+              const activeKey = apiKeys.find((k: any) => k.id === selectedKeyId) || apiKeys[0];
+              const res = await window.exco.chat.saveVoiceSession({
+                conversationId,
+                payload,
+                modelId: selectedModel,
+                providerId: activeKey?.providerId || 'auto',
+              });
+              setVoiceChatActive(false);
+              if (res?.conversation && !conversationId) {
+                justCreatedConvIdRef.current = res.conversationId;
+                activeConversationIdRef.current = res.conversationId;
+                setConversations(prev => [res.conversation!, ...prev]);
+                navigate(`/chat/${res.conversationId}`, { replace: true });
+              }
+              if (res?.message) {
+                setMessages(prev => [...prev, res.message]);
+              }
+              window.dispatchEvent(new CustomEvent('exco:conversations-updated'));
+            } catch (err) {
+              console.error('Failed to save voice chat transcript:', err);
+              setVoiceChatActive(false);
+            }
+          }}
+        />
+      )}
 
       {/* Centered Floating Pill Prompt Composer (Matched to Work Mode) */}
       <div className="relative z-20 flex-shrink-0 px-4 md:px-8 pb-5 pt-2 bg-transparent">
@@ -1711,7 +1770,7 @@ const ChatbotMode: React.FC = () => {
                 <button
                   type="button"
                   onClick={handleToggleVoiceInput}
-                  disabled={isTranscribing}
+                  disabled={isTranscribing || voiceChatActive}
                   className={cn(
                     'w-8 h-8 flex items-center justify-center rounded-full transition-colors',
                     isRecording
@@ -1723,6 +1782,32 @@ const ChatbotMode: React.FC = () => {
                   title={isRecording ? 'Stop recording and convert speech to text' : isTranscribing ? 'Transcribing audio...' : 'Voice input (speech to text)'}
                 >
                   {isTranscribing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Mic className="w-4 h-4" />}
+                </button>
+
+                {/* Live Voice Chat Button (Right next to Voice Input Button) */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (voiceChatActive) {
+                      window.dispatchEvent(new CustomEvent('exco:voice-chat-restore'));
+                      return;
+                    }
+                    if (isRecording) {
+                      cleanupAudioCapture();
+                      setIsRecording(false);
+                    }
+                    setVoiceError(null);
+                    setVoiceChatActive(true);
+                  }}
+                  className={cn(
+                    'w-8 h-8 flex items-center justify-center rounded-full transition-colors',
+                    voiceChatActive
+                      ? 'bg-sky-500/20 text-sky-400 animate-pulse ring-1 ring-sky-400/50'
+                      : 'text-[rgb(var(--color-foreground-muted))] hover:text-[rgb(var(--color-foreground))] hover:bg-[rgb(var(--color-surface-hover))]'
+                  )}
+                  title={voiceChatActive ? 'Live voice chat active' : 'Start live voice chat'}
+                >
+                  <AudioLines className="w-4 h-4" />
                 </button>
 
                 {/* Send Button */}

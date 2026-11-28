@@ -172,12 +172,12 @@ export function buildActiveSkillContext(userPrompt: string, maxSkills = 3): stri
   const activeSkills = getResolvedSkills(state).filter(s => s.enabled);
   if (activeSkills.length === 0) return undefined;
 
-  const stopWords = new Set(['the', 'and', 'for', 'with', 'that', 'this', 'from', 'your', 'into', 'what', 'how', 'can', 'you', 'please', 'help', 'make', 'create', 'build', 'code', 'file', 'files', 'using', 'used']);
+  const stopWords = new Set(['the', 'and', 'for', 'with', 'that', 'this', 'from', 'your', 'into', 'what', 'how', 'can', 'you', 'are', 'was', 'were', 'who', 'why', 'when', 'where', 'hear', 'talk', 'tell', 'say', 'yes', 'hey', 'please', 'help', 'make', 'create', 'build', 'code', 'file', 'files', 'using', 'used']);
   const tokens = Array.from(
     new Set(
       trimmed
         .split(/[^a-z0-9+.#-]+/)
-        .filter(w => w.length >= 2 && !stopWords.has(w))
+        .filter(w => w.length >= 3 && !stopWords.has(w))
     )
   );
   if (tokens.length === 0) return undefined;
@@ -190,12 +190,13 @@ export function buildActiveSkillContext(userPrompt: string, maxSkills = 3): stri
     let score = 0;
 
     for (const tok of tokens) {
-      if (nameL.includes(tok)) score += 6;
-      if (catL.includes(tok)) score += 3;
-      if (descL.includes(tok)) score += 2;
+      const wordRe = new RegExp(`\\b${tok.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+      if (wordRe.test(nameL)) score += 6;
+      if (wordRe.test(catL)) score += 3;
+      if (wordRe.test(descL)) score += 2;
     }
 
-    if (score >= 3) {
+    if (score >= 4) {
       if (!skill.builtIn) score += 2; // Slightly prioritize user-added custom skills on ties
       scored.push({ skill, score });
     }

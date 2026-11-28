@@ -30,6 +30,9 @@ interface GeminiGenerateContentRequest {
     maxOutputTokens?: number;
     topP?: number;
     topK?: number;
+    thinkingConfig?: {
+      thinkingBudget?: number;
+    };
   };
 }
 
@@ -196,14 +199,8 @@ export class GeminiProvider extends BaseAIProvider {
     }
   }
 
-  async complete(options: CompletionOptions): Promise<CompletionResponse> {
-    const apiKey = this.config.apiKey || process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      throw new Error('Gemini API key is not configured. Please add your API key in the Sidebar > API Keys panel.');
-    }
-
-    const modelName = this.normalizeModelName(options.model);
-    const contents: GeminiContent[] = options.messages.map(msg => {
+  private buildContentsAndRequest(options: CompletionOptions, modelName: string): GeminiGenerateContentRequest {
+    const rawContents: GeminiContent[] = options.messages.map(msg => {
       if (typeof msg.content === 'string') {
         return {
           role: msg.role === 'assistant' ? 'model' : 'user',
@@ -249,12 +246,30 @@ export class GeminiProvider extends BaseAIProvider {
       };
     });
 
+    // Merge consecutive same-role turns so Gemini never rejects back-to-back user/model items
+    const contents: GeminiContent[] = [];
+    for (const item of rawContents) {
+      const prev = contents[contents.length - 1];
+      if (prev && prev.role === item.role) {
+        prev.parts.push(...item.parts);
+      } else {
+        contents.push({ role: item.role, parts: [...item.parts] });
+      }
+    }
+
+    const generationConfig: GeminiGenerateContentRequest['generationConfig'] = {
+      temperature: options.temperature ?? 0.7,
+      maxOutputTokens: options.maxTokens ?? 8192,
+    };
+
+    // Disable hidden thinking delay on Gemini 2.5 Flash for crisp low-latency voice turns
+    if (modelName.includes('2.5-flash') && !modelName.includes('pro') && options.maxTokens && options.maxTokens <= 1024) {
+      generationConfig.thinkingConfig = { thinkingBudget: 0 };
+    }
+
     const reqBody: GeminiGenerateContentRequest = {
       contents,
-      generationConfig: {
-        temperature: options.temperature ?? 0.7,
-        maxOutputTokens: options.maxTokens ?? 8192,
-      },
+      generationConfig,
     };
 
     if (options.systemPrompt) {
@@ -262,6 +277,18 @@ export class GeminiProvider extends BaseAIProvider {
         parts: [{ text: options.systemPrompt }],
       };
     }
+
+    return reqBody;
+  }
+
+  async complete(options: CompletionOptions): Promise<CompletionResponse> {
+    const apiKey = this.config.apiKey || process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      throw new Error('Gemini API key is not configured. Please add your API key in the Sidebar > API Keys panel.');
+    }
+
+    const modelName = this.normalizeModelName(options.model);
+    const reqBody = this.buildContentsAndRequest(options, modelName);
 
     const response = await fetch(`${this.getBaseUrl()}/models/${modelName}:generateContent`, {
       method: 'POST',
@@ -280,7 +307,11 @@ export class GeminiProvider extends BaseAIProvider {
 
     const data: any = await response.json();
     const candidate = data.candidates?.[0];
-    const text = candidate?.content?.parts?.map((p: any) => p.text).join('') || '';
+    const text =
+      candidate?.content?.parts
+        ?.filter((p: any) => typeof p?.text === 'string' && !p.thought)
+        .map((p: any) => p.text)
+        .join('') || '';
 
     const usage: TokenUsage | undefined = data.usageMetadata ? {
       inputTokens: data.usageMetadata.promptTokenCount || 0,
@@ -290,23 +321,98 @@ export class GeminiProvider extends BaseAIProvider {
 
     return {
       content: text,
+      model: modelName,
       usage,
       finishReason: 'stop',
     };
   }
 
   async streamComplete(options: CompletionOptions, callbacks: StreamCallbacks): Promise<void> {
+    const apiKey = this.config.apiKey || process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      callbacks.onError?.(new Error('Gemini API key is not configured. Please add your API key in the Sidebar > API Keys panel.'));
+      return;
+    }
+
+    const modelName = this.normalizeModelName(options.model);
+    const reqBody = this.buildContentsAndRequest(options, modelName);
+
     try {
-      const result = await this.complete(options);
-      if (callbacks.onContent) {
-        callbacks.onContent(result.content);
+      const response = await fetch(`${this.getBaseUrl()}/models/${modelName}:streamGenerateContent?alt=sse`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey,
+        },
+        body: JSON.stringify(reqBody),
+        signal: options.signal,
+      });
+
+      if (!response.ok) {
+        const errText = await response.text().catch(() => response.statusText);
+        callbacks.onError?.(new Error(`Gemini API Error (${response.status}): ${errText}`));
+        return;
       }
-      if (callbacks.onDone) {
-        callbacks.onDone(result.usage);
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        const result = await this.complete(options);
+        if (result.content) callbacks.onContent?.(result.content);
+        callbacks.onDone?.(result.usage);
+        return;
       }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let lastUsage: TokenUsage | undefined;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const jsonStr = trimmed.slice(5).trim();
+          if (!jsonStr || jsonStr === '[DONE]') continue;
+
+          try {
+            const payload: any = JSON.parse(jsonStr);
+            if (payload?.error) {
+              callbacks.onError?.(new Error(`Gemini API Error: ${payload.error.message || JSON.stringify(payload.error)}`));
+              return;
+            }
+            const parts: any[] = payload?.candidates?.[0]?.content?.parts || [];
+            for (const part of parts) {
+              if (part?.thought) {
+                if (typeof part.text === 'string' && part.text) {
+                  callbacks.onReasoning?.(part.text);
+                }
+                continue;
+              }
+              if (typeof part?.text === 'string' && part.text) {
+                callbacks.onContent?.(part.text);
+              }
+            }
+            if (payload?.usageMetadata) {
+              lastUsage = {
+                inputTokens: payload.usageMetadata.promptTokenCount || 0,
+                outputTokens: payload.usageMetadata.candidatesTokenCount || 0,
+                totalTokens: payload.usageMetadata.totalTokenCount || 0,
+              };
+            }
+          } catch {}
+        }
+      }
+
+      callbacks.onDone?.(lastUsage);
     } catch (err: any) {
       if (callbacks.onError) {
-        callbacks.onError(err);
+        callbacks.onError(err instanceof Error ? err : new Error(String(err || 'Gemini stream failed')));
       } else {
         throw err;
       }

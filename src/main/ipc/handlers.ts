@@ -94,7 +94,19 @@ import {
   initializeVault,
   getVaultStatus,
 } from '@main/services/credential-vault';
-import { generateId, now, isPathWithin, normalizePath, getDefaultShell, inferProviderFromApiKey, resolveApiKeyProfile, inferModelTier } from '@shared/utils';
+import {
+  generateId,
+  now,
+  isPathWithin,
+  normalizePath,
+  getDefaultShell,
+  inferProviderFromApiKey,
+  resolveApiKeyProfile,
+  inferModelTier,
+  serializeVoiceSession,
+  stripVoiceSessionMarkerForContext,
+} from '@shared/utils';
+import type { VoiceSessionPayload } from '@shared/types';
 import { EXCO_FOLDER_NAME, GOVERNANCE_FILES, TIMEOUTS, ERROR_CODES, IPC_CHANNELS, MAX_FILE_SIZE_FOR_EDIT } from '@shared/constants';
 import { providerManager } from '@main/services/ai-providers';
 import {
@@ -106,6 +118,10 @@ import {
 } from '@main/services/workspace-agent';
 import {
   collectAllModelCandidates,
+  getModelQualityTier,
+  invalidateCandidatePoolCache,
+  isAuthError,
+  markKeyAuthFailed,
   routeTurnWithOverviewer,
   markModelExhausted,
   isQuotaOrModelUnavailableError,
@@ -154,7 +170,116 @@ let terminalSessions: Map<string, { pty: any; session: TerminalSession }> = new 
 let fileWatchers: Map<string, fsSync.FSWatcher> = new Map();
 let activeStreamAbortControllers: Map<string, AbortController> = new Map();
 const activeChatAbortControllers: Map<string, Set<AbortController>> = new Map();
+const activeVoiceAbortControllers: Map<string, AbortController> = new Map();
 const deletedConversationIds: Set<string> = new Set();
+
+// Persistent warm MsEdgeTTS client to avoid 3-5s cold WebSocket handshakes on every sentence
+let sharedEdgeTtsClient: any = null;
+let sharedEdgeTtsVoice = '';
+let edgeTtsChain: Promise<any> = Promise.resolve();
+
+// In-memory LRU audio cache for short phrases & previews (returns in <1ms)
+interface CachedTtsEntry {
+  audioBase64: string;
+  mimeType: string;
+  source: string;
+}
+const TTS_CACHE_MAX_ENTRIES = 80;
+const ttsAudioCache = new Map<string, CachedTtsEntry>();
+
+function getCachedTtsAudio(key: string): CachedTtsEntry | undefined {
+  const hit = ttsAudioCache.get(key);
+  if (!hit) return undefined;
+  // Refresh LRU order
+  ttsAudioCache.delete(key);
+  ttsAudioCache.set(key, hit);
+  return hit;
+}
+
+function setCachedTtsAudio(key: string, entry: CachedTtsEntry): void {
+  if (!key || !entry.audioBase64) return;
+  if (ttsAudioCache.has(key)) ttsAudioCache.delete(key);
+  ttsAudioCache.set(key, entry);
+  if (ttsAudioCache.size > TTS_CACHE_MAX_ENTRIES) {
+    const oldestKey = ttsAudioCache.keys().next().value;
+    if (oldestKey) ttsAudioCache.delete(oldestKey);
+  }
+}
+
+async function warmEdgeTtsClient(voiceName?: string): Promise<boolean> {
+  const task = edgeTtsChain.then(async () => {
+    try {
+      const { MsEdgeTTS, OUTPUT_FORMAT } = await import('msedge-tts');
+      const targetVoice = (voiceName && voiceName.includes('Neural') ? voiceName : 'en-US-AvaNeural').trim();
+      if (sharedEdgeTtsClient && sharedEdgeTtsVoice === targetVoice) {
+        return true;
+      }
+      if (sharedEdgeTtsClient) {
+        try { sharedEdgeTtsClient.close?.(); } catch {}
+        sharedEdgeTtsClient = null;
+        sharedEdgeTtsVoice = '';
+      }
+      sharedEdgeTtsClient = new MsEdgeTTS({ connectionTimeoutMs: 2400, synthesisTimeoutMs: 4200 });
+      await sharedEdgeTtsClient.setMetadata(targetVoice, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+      sharedEdgeTtsVoice = targetVoice;
+      return true;
+    } catch {
+      try { sharedEdgeTtsClient?.close?.(); } catch {}
+      sharedEdgeTtsClient = null;
+      sharedEdgeTtsVoice = '';
+      return false;
+    }
+  });
+  edgeTtsChain = task.catch(() => false);
+  return task;
+}
+
+async function runEdgeTtsSynthesis(text: string, voiceName?: string): Promise<{ audioBase64: string; mimeType: string; source: string } | null> {
+  const task = edgeTtsChain.then(async () => {
+    const { MsEdgeTTS, OUTPUT_FORMAT } = await import('msedge-tts');
+    const targetVoice = (voiceName && voiceName.includes('Neural') ? voiceName : 'en-US-AvaNeural').trim();
+    const escapedText = text
+      .slice(0, 4000)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+
+    try {
+      // Recreate client when switching voices so metadata setup never stalls on a prior socket
+      if (sharedEdgeTtsClient && sharedEdgeTtsVoice !== targetVoice) {
+        try { sharedEdgeTtsClient.close?.(); } catch {}
+        sharedEdgeTtsClient = null;
+        sharedEdgeTtsVoice = '';
+      }
+      if (!sharedEdgeTtsClient) {
+        sharedEdgeTtsClient = new MsEdgeTTS({ connectionTimeoutMs: 2400, synthesisTimeoutMs: 4200 });
+        await sharedEdgeTtsClient.setMetadata(targetVoice, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
+        sharedEdgeTtsVoice = targetVoice;
+      }
+      const { audioStream } = sharedEdgeTtsClient.toStream(escapedText);
+      const chunks: Buffer[] = [];
+      for await (const chunk of audioStream) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      const combined = Buffer.concat(chunks);
+      if (combined.length > 0) {
+        return {
+          audioBase64: combined.toString('base64'),
+          mimeType: 'audio/mpeg',
+          source: 'edge-neural',
+        };
+      }
+    } catch (err: any) {
+      console.warn(`[TTS] Edge Neural (${targetVoice}):`, err?.message || err);
+      try { sharedEdgeTtsClient?.close?.(); } catch {}
+      sharedEdgeTtsClient = null;
+      sharedEdgeTtsVoice = '';
+    }
+    return null;
+  });
+  edgeTtsChain = task.catch(() => null);
+  return task;
+}
 
 function isConversationAbortedOrDeleted(conversationId: string, signal?: AbortSignal): boolean {
   if (!conversationId) return true;
@@ -314,6 +439,30 @@ async function probeEndpointForUnknownKey(secret: string): Promise<ReturnType<ty
       testUrl: 'https://api.openai.com/v1/models',
       headers: { Authorization: `Bearer ${secret}` },
       tier: 'paid',
+    },
+    {
+      providerId: 'custom',
+      displayName: 'LLM7 Gateway',
+      baseUrl: 'https://api.llm7.io/v1',
+      testUrl: 'https://api.llm7.io/v1/models',
+      headers: { Authorization: `Bearer ${secret}` },
+      tier: 'free',
+    },
+    {
+      providerId: 'custom',
+      displayName: 'Aion Labs',
+      baseUrl: 'https://api.aionlabs.ai/v1',
+      testUrl: 'https://api.aionlabs.ai/v1/models',
+      headers: { Authorization: `Bearer ${secret}` },
+      tier: 'free',
+    },
+    {
+      providerId: 'custom',
+      displayName: 'Parallel AI',
+      baseUrl: 'https://api.parallel.ai/v1',
+      testUrl: 'https://api.parallel.ai/v1/models',
+      headers: { Authorization: `Bearer ${secret}` },
+      tier: 'free',
     },
   ];
 
@@ -499,9 +648,49 @@ export function registerAppHandlers(): void {
 // Chatbot Handlers
 // ============================================================================
 
+// Fast STT engine memory & Voice session sticky model lock (prevents per-turn routing & Overviewer churn)
+let lastWorkingSttEngine: 'groq' | 'openai' | 'gemini' | null = null;
+const sttEngineCooldownUntil = new Map<string, number>();
+
+interface StickyVoiceSessionState {
+  requestedModel: string;
+  requestedKeyId: string;
+  lockedCandidate: RoutedCandidate;
+  orderedBackups: RoutedCandidate[];
+  updatedAt: number;
+}
+const activeVoiceStickyModels = new Map<string, StickyVoiceSessionState>();
+
+function isSttInCooldown(engine: string): boolean {
+  const until = sttEngineCooldownUntil.get(engine);
+  return Boolean(until && Date.now() < until);
+}
+
+function markSttCooldown(engine: string): void {
+  sttEngineCooldownUntil.set(engine, Date.now() + 90_000);
+  if (lastWorkingSttEngine === engine) {
+    lastWorkingSttEngine = null;
+  }
+}
+
 export function registerChatHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.CHAT_LIST_CONVERSATIONS, async () => {
-    return getConversations(false).filter(c => !String(c?.title || '').startsWith('[Work] '));
+    return getConversations(false).filter(c => {
+      const t = String(c?.title || '');
+      return !t.startsWith('[Work] ') && !t.startsWith('Work: ');
+    });
+  });
+
+  ipcMain.handle('work:list-conversations', async () => {
+    return getConversations(false)
+      .filter(c => {
+        const t = String(c?.title || '');
+        return t.startsWith('[Work] ') || t.startsWith('Work: ');
+      })
+      .map(c => ({
+        ...c,
+        title: String(c.title || '').replace(/^(\[Work\]\s*|Work:\s*)/i, '') || 'Work Chat',
+      }));
   });
 
   ipcMain.handle(IPC_CHANNELS.CHAT_CREATE_CONVERSATION, async (_event, input) => {
@@ -680,7 +869,15 @@ export function registerChatHandlers(): void {
           : `Generating reply with ${decision.selected.modelId}...`,
       });
 
-      const candidatesToTry: RoutedCandidate[] = decision.candidates;
+      // Prioritize Tier 1 Leading models across failover before secondary/obscure options
+      const candidatesToTry: RoutedCandidate[] = [];
+      for (const tier of [1, 2, 3] as const) {
+        for (const c of decision.candidates) {
+          if (getModelQualityTier(c.modelId, c.modelName) === tier) {
+            candidatesToTry.push(c);
+          }
+        }
+      }
       let assistantContent = '';
       let tokens: any = undefined;
       let failoverTransitionNote = '';
@@ -689,13 +886,15 @@ export function registerChatHandlers(): void {
       let usedProviderId = initialCandidate.providerId;
       let failoverCount = 0;
 
-      // Retry loop across all connected API keys/models on token/quota exhaustion
-      for (let attempt = 0; attempt < candidatesToTry.length && attempt < 5; attempt++) {
+      // Skip remaining candidates sharing an unauthorized key and switch silently in background
+      const failedAuthKeys = new Set<string>();
+      for (let attempt = 0; attempt < candidatesToTry.length && attempt < 10; attempt++) {
         if (isConversationAbortedOrDeleted(conversationId, abortController.signal)) {
           return { aborted: true, userMessage: null as any, assistantMessage: null as any };
         }
 
         const cand = candidatesToTry[attempt];
+        if (failedAuthKeys.has(cand.keyId)) continue;
         const profile = resolveApiKeyProfile(cand.keySecret, cand.providerId, cand.keyName);
         let endpointHost = cand.providerDisplayName;
         try {
@@ -704,7 +903,7 @@ export function registerChatHandlers(): void {
 
         if (attempt > 0) {
           emitStatus(
-            `Limit on ${candidatesToTry[attempt - 1].modelId} — switching to ${cand.modelId} (${endpointHost})...`,
+            `Routing via ${cand.modelId} (${endpointHost})...`,
             { modelId: cand.modelId, providerId: cand.providerId }
           );
         }
@@ -887,7 +1086,10 @@ export function registerChatHandlers(): void {
 
           if (attempt > 0 && (cand.modelId !== initialCandidate.modelId || cand.keyId !== initialCandidate.keyId)) {
             failoverCount = attempt;
-            failoverTransitionNote = `> ⚡ **Automatic Model Failover**: Limit reached on **${initialCandidate.modelId}**. Switched cleanly to **${finalModelId}** (${cand.providerDisplayName}).\n\n`;
+            // Suppress transition notices when the previous failure was silent background auth switching
+            if (!failedAuthKeys.has(initialCandidate.keyId)) {
+              failoverTransitionNote = `> ⚡ **Automatic Model Failover**: Limit reached on **${initialCandidate.modelId}**. Switched cleanly to **${finalModelId}** (${cand.providerDisplayName}).\n\n`;
+            }
           }
           updateConversation(conversationId, {
             modelId: isAutoRequested ? 'auto' : finalModelId,
@@ -907,13 +1109,17 @@ export function registerChatHandlers(): void {
             return { aborted: true, userMessage: null as any, assistantMessage: null as any };
           }
 
-          const hasNext = candidatesToTry.length > attempt + 1;
-          if (isQuotaOrModelUnavailableError(err)) {
-            markModelExhausted(cand.keyId, cand.modelId, err instanceof Error ? err.message : String(err));
+          const hasNext = candidatesToTry.slice(attempt + 1).some(c => !failedAuthKeys.has(c.keyId) && c.keyId !== cand.keyId) || candidatesToTry.length > attempt + 1;
+          const errStr = err instanceof Error ? err.message : String(err);
+          if (isAuthError(err)) {
+            failedAuthKeys.add(cand.keyId);
+            markKeyAuthFailed(cand.keyId, errStr);
+          } else if (isQuotaOrModelUnavailableError(err)) {
+            markModelExhausted(cand.keyId, cand.modelId, errStr);
           }
           if ((isQuotaOrModelUnavailableError(err) || preferredFailover !== false) && hasNext) {
             console.warn(
-              `[Overviewer-Failover] ${cand.modelId} (${cand.providerId}) failed (${err instanceof Error ? err.message : err}). Trying ${candidatesToTry[attempt + 1].modelId}...`
+              `[Overviewer-Failover] ${cand.modelId} (${cand.providerId}) failed (${errStr}). Silently switching in background...`
             );
             continue;
           }
@@ -1113,12 +1319,95 @@ export function registerChatHandlers(): void {
     });
   });
 
-  ipcMain.handle('chat:transcribe-audio', async (_event, input: { wavBase64: string; keyId?: string }) => {
+  ipcMain.handle('chat:transcribe-audio', async (_event, input: { wavBase64: string; keyId?: string; preferredEngine?: 'auto' | 'gemini' | 'openai-whisper' | 'windows-speech'; language?: string }) => {
     const cleanBase64 = (input?.wavBase64 || '').replace(/^data:[^;]+;base64,/, '').trim();
     if (!cleanBase64) {
       return { text: '', source: 'none', error: 'No audio captured' };
     }
 
+    // Server-side PCM WAV energy, voiced-frame density & duration gate so silent/ambient buffers never trigger Whisper hallucinations
+    const wavBuf = Buffer.from(cleanBase64, 'base64');
+    const pcmOffset = wavBuf.length > 44 ? 44 : 0;
+    const sampleCount = Math.floor((wavBuf.length - pcmOffset) / 2);
+    const wavSampleRate = wavBuf.length >= 28 ? wavBuf.readUInt32LE(24) || 48000 : 48000;
+    const wavDurationSec = sampleCount / Math.max(8000, wavSampleRate);
+    if (sampleCount < 2400 || wavDurationSec < 0.16) {
+      return { text: '', source: 'silence-gate' };
+    }
+    let sumSq = 0;
+    let peakAmp = 0;
+    const winSamples = Math.max(160, Math.floor(wavSampleRate * 0.02));
+    let totalWindows = 0;
+    let voicedWindows = 0;
+    let winSumSq = 0;
+    let winCount = 0;
+    for (let i = pcmOffset; i + 1 < wavBuf.length; i += 2) {
+      const norm = wavBuf.readInt16LE(i) / 32768;
+      const abs = Math.abs(norm);
+      if (abs > peakAmp) peakAmp = abs;
+      sumSq += norm * norm;
+      winSumSq += norm * norm;
+      winCount += 1;
+      if (winCount >= winSamples) {
+        totalWindows += 1;
+        if (Math.sqrt(winSumSq / winCount) >= 0.016) {
+          voicedWindows += 1;
+        }
+        winSumSq = 0;
+        winCount = 0;
+      }
+    }
+    const wavRms = Math.sqrt(sumSq / sampleCount);
+    const voicedSubFrameRatio = totalWindows > 0 ? voicedWindows / totalWindows : 0;
+    if ((wavRms < 0.0085 && peakAmp < 0.04) || voicedWindows < 2) {
+      return { text: '', source: 'silence-gate' };
+    }
+
+    const filterGhostTranscript = (raw: string, source: string, noSpeechProb?: number, avgLogprob?: number) => {
+      const cleaned = (raw || '').trim();
+      if (!cleaned) return null;
+      if (typeof noSpeechProb === 'number' && (noSpeechProb > 0.50 || (noSpeechProb > 0.35 && (avgLogprob ?? 0) < -0.9))) {
+        return { text: '', source: `${source}-nospeech-guard` };
+      }
+      const lowerNorm = cleaned.toLowerCase().replace(/[^\w\s']/g, '').trim();
+      const whisperNoiseHallucinations = new Set([
+        'thank you',
+        'thank you very much',
+        'thank you so much',
+        'thanks',
+        'thanks for watching',
+        'thank you for watching',
+        'bye',
+        'bye bye',
+        'goodbye',
+        'you',
+        'yes',
+        'oh',
+        'okay',
+        'mbc',
+        'subtitles by',
+        'captioned by',
+        'amaraorg',
+        'music',
+        'silence',
+      ]);
+      // Block Whisper silence/reverb hallucinations when vocal energy/density is borderline or clip is brief low-peak noise
+      if (whisperNoiseHallucinations.has(lowerNorm) || cleaned.length <= 2) {
+        if (
+          wavRms < 0.065 ||
+          voicedSubFrameRatio < 0.32 ||
+          (wavDurationSec < 1.4 && peakAmp < 0.14)
+        ) {
+          return { text: '', source: `${source}-hallucination-guard` };
+        }
+      }
+      return { text: cleaned, source };
+    };
+
+    const preferredEngine = input?.preferredEngine || 'auto';
+    const lang = (input?.language || 'en').trim().toLowerCase();
+    const isEnglish = !lang || lang === 'en' || lang.startsWith('en-');
+    const whisperLang = lang === 'auto' ? '' : lang.split('-')[0];
     const allKeys = getApiKeys();
     const resolveKeySecret = async (match: ApiKeyEntry): Promise<string | null> => {
       const k = await getStoredApiKey(match.providerId, match.keyName);
@@ -1132,25 +1421,38 @@ export function registerChatHandlers(): void {
     };
 
     const providerKeys: Record<string, string> = {};
+    let groqKey = '';
     const selectedKeyEntry = input?.keyId ? allKeys.find(k => k.id === input.keyId) : undefined;
     if (selectedKeyEntry) {
       const secret = await resolveKeySecret(selectedKeyEntry);
-      if (secret) providerKeys[inferProviderFromApiKey(secret, selectedKeyEntry.providerId)] = secret;
+      if (secret) {
+        const resolved = inferProviderFromApiKey(secret, selectedKeyEntry.providerId, selectedKeyEntry.keyName);
+        providerKeys[resolved] = secret;
+        if (secret.trim().startsWith('gsk_') || selectedKeyEntry.keyName.toLowerCase().includes('groq')) {
+          groqKey = secret;
+        }
+      }
     }
     for (const kEntry of allKeys) {
       const secret = await resolveKeySecret(kEntry);
       if (secret) {
-        const resolved = inferProviderFromApiKey(secret, kEntry.providerId);
+        const resolved = inferProviderFromApiKey(secret, kEntry.providerId, kEntry.keyName);
         if (!providerKeys[resolved]) providerKeys[resolved] = secret;
+        if (!groqKey && (secret.trim().startsWith('gsk_') || kEntry.keyName.toLowerCase().includes('groq'))) {
+          groqKey = secret;
+        }
       }
     }
     if (!providerKeys.google && process.env.GEMINI_API_KEY) {
       providerKeys.google = process.env.GEMINI_API_KEY;
     }
 
-    // 1. Try Gemini audio transcription if a Google key is available
-    if (providerKeys.google) {
+    const tryGemini = async () => {
+      if (!providerKeys.google) return null;
       try {
+        const geminiPrompt = isEnglish
+          ? 'The speaker is speaking English. Transcribe this spoken English audio accurately into plain English text with punctuation. Do not translate into any other language and do not output non-English words or scripts. Return ONLY the English transcription and nothing else. If silence or unintelligible, return empty string.'
+          : `Transcribe this spoken audio (language hint: ${lang}) accurately into plain text with punctuation. Return ONLY the transcribed text and nothing else. If silence or unintelligible, return empty string.`;
         const resp = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${providerKeys.google}`,
           {
@@ -1161,49 +1463,149 @@ export function registerChatHandlers(): void {
                 {
                   role: 'user',
                   parts: [
-                    { text: 'Transcribe this spoken audio accurately into plain text with punctuation. Return ONLY the transcribed text and nothing else. If silence or unintelligible, return empty string.' },
+                    { text: geminiPrompt },
                     { inlineData: { mimeType: 'audio/wav', data: cleanBase64 } },
                   ],
                 },
               ],
-              generationConfig: { temperature: 0.1, maxOutputTokens: 1024 },
+              generationConfig: {
+                temperature: 0.1,
+                maxOutputTokens: 512,
+                thinkingConfig: { thinkingBudget: 0 },
+              },
             }),
+            signal: AbortSignal.timeout(4500),
           }
         );
         if (resp.ok) {
           const data: any = await resp.json();
-          const text = (data?.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join('') || '').trim();
+          const text = (data?.candidates?.[0]?.content?.parts?.filter((p: any) => !p?.thought).map((p: any) => p.text).join('') || '').trim();
+          lastWorkingSttEngine = 'gemini';
           if (text) return { text, source: 'gemini' };
+        } else {
+          markSttCooldown('gemini');
         }
       } catch {
-        // Fall through to next recognizer
+        markSttCooldown('gemini');
       }
-    }
+      return null;
+    };
 
-    // 2. Try OpenAI Whisper if an OpenAI key is available
-    if (providerKeys.openai) {
+    const tryOpenAiWhisper = async () => {
+      if (!providerKeys.openai) return null;
       try {
         const audioBuffer = Buffer.from(cleanBase64, 'base64');
         const formData = new FormData();
         formData.append('file', new Blob([audioBuffer], { type: 'audio/wav' }), 'voice.wav');
         formData.append('model', 'whisper-1');
+        formData.append('response_format', 'verbose_json');
+        formData.append('temperature', '0');
+        if (whisperLang) formData.append('language', whisperLang);
 
         const resp = await fetch('https://api.openai.com/v1/audio/transcriptions', {
           method: 'POST',
           headers: { Authorization: `Bearer ${providerKeys.openai}` },
           body: formData as any,
+          signal: AbortSignal.timeout(4200),
         });
         if (resp.ok) {
           const data: any = await resp.json();
           const text = (data?.text || '').trim();
-          if (text) return { text, source: 'openai-whisper' };
+          const firstSeg = Array.isArray(data?.segments) ? data.segments[0] : undefined;
+          lastWorkingSttEngine = 'openai';
+          if (text) {
+            return {
+              text,
+              source: 'openai-whisper',
+              noSpeechProb: typeof firstSeg?.no_speech_prob === 'number' ? firstSeg.no_speech_prob : undefined,
+              avgLogprob: typeof firstSeg?.avg_logprob === 'number' ? firstSeg.avg_logprob : undefined,
+            };
+          }
+        } else {
+          markSttCooldown('openai');
         }
       } catch {
-        // Fall through to local OS recognizer
+        markSttCooldown('openai');
+      }
+      return null;
+    };
+
+    const tryGroqWhisper = async () => {
+      if (!groqKey) return null;
+      try {
+        const audioBuffer = Buffer.from(cleanBase64, 'base64');
+        const formData = new FormData();
+        formData.append('file', new Blob([audioBuffer], { type: 'audio/wav' }), 'voice.wav');
+        formData.append('model', 'whisper-large-v3-turbo');
+        formData.append('response_format', 'verbose_json');
+        formData.append('temperature', '0');
+        if (whisperLang) formData.append('language', whisperLang);
+
+        const resp = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${groqKey}` },
+          body: formData as any,
+          signal: AbortSignal.timeout(3500),
+        });
+        if (resp.ok) {
+          const data: any = await resp.json();
+          const text = (data?.text || '').trim();
+          const firstSeg = Array.isArray(data?.segments) ? data.segments[0] : undefined;
+          lastWorkingSttEngine = 'groq';
+          if (text) {
+            return {
+              text,
+              source: 'groq-whisper',
+              noSpeechProb: typeof firstSeg?.no_speech_prob === 'number' ? firstSeg.no_speech_prob : undefined,
+              avgLogprob: typeof firstSeg?.avg_logprob === 'number' ? firstSeg.avg_logprob : undefined,
+            };
+          }
+        } else {
+          markSttCooldown('groq');
+        }
+      } catch {
+        markSttCooldown('groq');
+      }
+      return null;
+    };
+
+    if (preferredEngine === 'openai-whisper') {
+      const openaiHit = await tryOpenAiWhisper();
+      if (openaiHit) {
+        return filterGhostTranscript(openaiHit.text, openaiHit.source, openaiHit.noSpeechProb, openaiHit.avgLogprob) || { text: '', source: 'hallucination-guard' };
+      }
+    } else if (preferredEngine === 'gemini') {
+      const gemHit = await tryGemini();
+      if (gemHit) return filterGhostTranscript(gemHit.text, gemHit.source) || { text: '', source: 'hallucination-guard' };
+    }
+
+    if (preferredEngine !== 'windows-speech') {
+      // Prioritize last-known working fast cloud STT first and skip cooled-down engines so latency stays under ~400ms
+      const order: Array<'groq' | 'openai' | 'gemini'> = ['groq', 'openai', 'gemini'];
+      if (lastWorkingSttEngine && order.includes(lastWorkingSttEngine)) {
+        order.splice(order.indexOf(lastWorkingSttEngine), 1);
+        order.unshift(lastWorkingSttEngine);
+      }
+      for (const eng of order) {
+        if (isSttInCooldown(eng)) continue;
+        const hit =
+          eng === 'groq'
+            ? await tryGroqWhisper()
+            : eng === 'openai'
+            ? await tryOpenAiWhisper()
+            : await tryGemini();
+        if (hit) {
+          return (
+            filterGhostTranscript(hit.text, hit.source, (hit as any).noSpeechProb, (hit as any).avgLogprob) || {
+              text: '',
+              source: 'hallucination-guard',
+            }
+          );
+        }
       }
     }
 
-    // 3. Offline Windows System.Speech dictation fallback (requires no API key)
+    // Offline Windows System.Speech dictation fallback (requires no API key)
     if (process.platform === 'win32') {
       const execFileAsync = promisify(execFile);
       const tmpWavPath = path.join(os.tmpdir(), `exco-voice-${Date.now()}-${Math.random().toString(36).slice(2)}.wav`);
@@ -1212,7 +1614,11 @@ export function registerChatHandlers(): void {
         const safePath = tmpWavPath.replace(/'/g, "''");
         const psScript = [
           'Add-Type -AssemblyName System.Speech',
-          '$rec = New-Object System.Speech.Recognition.SpeechRecognitionEngine',
+          ...(isEnglish
+            ? [
+                'try { $rec = New-Object System.Speech.Recognition.SpeechRecognitionEngine([System.Globalization.CultureInfo]::GetCultureInfo("en-US")) } catch { $rec = New-Object System.Speech.Recognition.SpeechRecognitionEngine }',
+              ]
+            : ['$rec = New-Object System.Speech.Recognition.SpeechRecognitionEngine']),
           '$rec.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar))',
           `$rec.SetInputToWaveFile('${safePath}')`,
           '$parts = @()',
@@ -1241,8 +1647,581 @@ export function registerChatHandlers(): void {
     return {
       text: '',
       source: 'none',
-      error: 'No transcription engine available. Configure a Gemini or OpenAI key in Sidebar > API Keys.',
+      error: 'No transcription engine available. Configure an API key in Sidebar > API Keys.',
     };
+  });
+
+  // Isolated Live Voice Chat Turn: routes dynamically via EXCO Model Router & Overviewer across ALL providers,
+  // never writes messages to SQLite during the live session, and never emits chat:live-progress into the chat thread.
+  ipcMain.handle('chat:voice-turn', async (_event, input: {
+    sessionId: string;
+    conversationId?: string;
+    userText: string;
+    voiceHistory: Array<{ role: 'user' | 'assistant'; text: string }>;
+    modelId?: string;
+    providerId?: string;
+    keyId?: string;
+    preferredFailover?: boolean;
+    workflowMode?: 'auto' | 'turbo' | 'standard' | 'deep-thought';
+    skillContext?: string;
+    language?: string;
+  }) => {
+    const sessionId = input?.sessionId || `voice-${Date.now()}`;
+    const userText = (input?.userText || '').trim();
+    if (!userText) {
+      return { assistantText: '', modelId: 'none', providerId: 'none', error: 'Empty voice input' };
+    }
+
+    // Cancel any previous in-flight turn on the same voice session
+    const prevCtrl = activeVoiceAbortControllers.get(sessionId);
+    if (prevCtrl) {
+      try { prevCtrl.abort(); } catch {}
+    }
+    const abortController = new AbortController();
+    activeVoiceAbortControllers.set(sessionId, abortController);
+
+    const emitVoiceStatus = (statusText: string, extra: Record<string, any> = {}) => {
+      sendToRenderer('chat:voice-progress', {
+        sessionId,
+        type: 'status',
+        statusText,
+        ...extra,
+      });
+    };
+
+    try {
+      const isAutoRequested = !input.modelId || input.modelId === 'auto' || input.modelId === 'default';
+      const requestedModel = isAutoRequested ? 'auto' : input.modelId!;
+      const requestedKeyId = input.keyId || '';
+
+      const existingSticky = activeVoiceStickyModels.get(sessionId);
+      const canReuseSticky = Boolean(
+        existingSticky &&
+        existingSticky.requestedModel === requestedModel &&
+        existingSticky.requestedKeyId === requestedKeyId &&
+        Date.now() - existingSticky.updatedAt < 30 * 60 * 1000
+      );
+
+      let candidatesToTry: RoutedCandidate[] = [];
+      let taskType: any = 'fast-chat';
+      let overviewerModelIdUsed: string | undefined;
+
+      if (canReuseSticky && existingSticky) {
+        // Reuse the locked working voice model immediately (0ms discovery/routing lag across casual & serious prompts)
+        candidatesToTry = [existingSticky.lockedCandidate, ...existingSticky.orderedBackups];
+        sendToRenderer('chat:voice-progress', {
+          sessionId,
+          type: 'routing',
+          taskType: 'fast-chat',
+          modelId: existingSticky.lockedCandidate.modelId,
+          providerId: existingSticky.lockedCandidate.providerId,
+          statusText: `Speaking with ${existingSticky.lockedCandidate.modelId}...`,
+        });
+      } else {
+        emitVoiceStatus('Selecting best model for voice turn...');
+        const allKeys = getApiKeys();
+        const pool = await collectAllModelCandidates(allKeys, resolveKeySecretForRouter, abortController.signal);
+
+        if (abortController.signal.aborted) {
+          return { aborted: true, assistantText: '', modelId: 'none', providerId: 'none' };
+        }
+
+        if (pool.length === 0) {
+          return {
+            assistantText: 'Please add an API key in Sidebar API Keys so I can reply in voice chat.',
+            modelId: 'No API Key',
+            providerId: 'none',
+            error: 'No API key configured',
+          };
+        }
+
+        const conv = input.conversationId ? getConversation(input.conversationId) : null;
+        // Force 'turbo' (zero Overviewer keyword switching) in Voice Chat so serious questions keep the same reliable fast model
+        const decision = await routeTurnWithOverviewer({
+          pool,
+          promptText: userText,
+          requestedModel,
+          preferredKeyId: input.keyId,
+          workflowMode: 'turbo',
+          reasoningEffort: conv?.reasoningEffort,
+          hasHeavyAttachments: false,
+          hasAnyAttachment: false,
+          preferredFailover: input.preferredFailover !== false,
+          signal: abortController.signal,
+          onStatus: msg => emitVoiceStatus(msg),
+        });
+
+        if (abortController.signal.aborted || !decision) {
+          return { aborted: true, assistantText: '', modelId: 'none', providerId: 'none' };
+        }
+
+        taskType = decision.taskType;
+        overviewerModelIdUsed = decision.overviewerUsed?.modelId;
+
+        sendToRenderer('chat:voice-progress', {
+          sessionId,
+          type: 'routing',
+          taskType: decision.taskType,
+          modelId: decision.selected.modelId,
+          providerId: decision.selected.providerId,
+          overviewerModelId: decision.overviewerUsed?.modelId,
+          statusText: `Speaking with ${decision.selected.modelId}...`,
+        });
+
+        // Strictly exhaust ALL Tier 1 Leading Models (across connected keys in round-robin)
+        // before trying Tier 2 Secondary, and ONLY touch Tier 3 obscure engines if ZERO Tier 1/2 tokens remain.
+        for (const tier of [1, 2, 3] as const) {
+          const tierList = decision.candidates.filter(c => getModelQualityTier(c.modelId, c.modelName) === tier);
+          const bucketsByKey = new Map<string, RoutedCandidate[]>();
+          for (const c of tierList) {
+            const list = bucketsByKey.get(c.keyId) || [];
+            list.push(c);
+            bucketsByKey.set(c.keyId, list);
+          }
+          let addedInPass = true;
+          while (addedInPass) {
+            addedInPass = false;
+            for (const list of bucketsByKey.values()) {
+              const nextCand = list.shift();
+              if (nextCand) {
+                candidatesToTry.push(nextCand);
+                addedInPass = true;
+              }
+            }
+          }
+        }
+      }
+
+      // Build isolated conversation context: prior DB messages (if any) + in-memory voice turns + current utterance
+      const priorDbMessages: Message[] = input.conversationId
+        ? getMessages(input.conversationId).map(m => ({
+            ...m,
+            content: typeof m.content === 'string' ? stripVoiceSessionMarkerForContext(m.content) : m.content,
+          }))
+        : [];
+
+      const voiceHistoryMessages: Message[] = (Array.isArray(input.voiceHistory) ? input.voiceHistory : [])
+        .filter(h => h && (h.role === 'user' || h.role === 'assistant') && typeof h.text === 'string' && h.text.trim())
+        .map((h, idx) => ({
+          id: `voice-hist-${idx}`,
+          conversationId: input.conversationId || sessionId,
+          role: h.role,
+          content:
+            h.role === 'assistant'
+              ? h.text.replace(/^\s*(?:\*{0,2}(?:AI\s*Assistant|Assistant|EXCO(?:\s+AI)?|Model|Bot)\*{0,2}\s*[:\-–—]\s*)+/i, '').trim()
+              : h.text,
+          createdAt: Date.now(),
+          status: 'complete' as const,
+        }));
+
+      const currentUserMsg: Message = {
+        id: `voice-cur-${Date.now()}`,
+        conversationId: input.conversationId || sessionId,
+        role: 'user',
+        content: userText,
+        createdAt: Date.now(),
+        status: 'complete',
+      };
+
+      // Merge consecutive same-role text messages so providers (DeepSeek/Anthropic/Gemini) never reject back-to-back user turns
+      const rawHistory = [...priorDbMessages, ...voiceHistoryMessages, currentUserMsg];
+      const history: Message[] = [];
+      for (const m of rawHistory) {
+        const last = history[history.length - 1];
+        if (last && last.role === m.role && typeof last.content === 'string' && typeof m.content === 'string') {
+          last.content = `${last.content}\n${m.content}`;
+        } else {
+          history.push({ ...m });
+        }
+      }
+      const voiceLang = (input?.language || 'en').trim().toLowerCase();
+      const langInstruction =
+        !voiceLang || voiceLang === 'en' || voiceLang.startsWith('en-')
+          ? 'Always understand the user in English and reply strictly in natural English unless the user explicitly asks you to speak in another language.'
+          : voiceLang === 'auto'
+          ? 'Reply in the same language the user is speaking.'
+          : `Reply in language "${voiceLang}" unless the user asks otherwise.`;
+      const voiceSystemPrompt = `[LIVE VOICE CHAT MODE]\nYou are speaking directly in a live bidirectional voice conversation. ${langInstruction} Reply naturally and concisely in 1-3 spoken sentences (unless asked for more detail). Speak directly—NEVER start your reply with "AI Assistant:", "Assistant:", "EXCO:", or any speaker label, and never recite unrelated technical skills.`;
+
+      let assistantText = '';
+      let tokens: any = undefined;
+      let usedModelId = candidatesToTry[0]?.modelId || 'auto';
+      let usedProviderId = candidatesToTry[0]?.providerId || 'auto';
+      let failoverCount = 0;
+      let lastErrorMsg = '';
+      const failedVoiceAuthKeys = new Set<string>();
+      const maxAttempts = Math.min(candidatesToTry.length, 14);
+
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        if (abortController.signal.aborted) {
+          return { aborted: true, assistantText: '', modelId: usedModelId, providerId: usedProviderId };
+        }
+
+        const cand = candidatesToTry[attempt];
+        if (failedVoiceAuthKeys.has(cand.keyId)) continue;
+        const profile = resolveApiKeyProfile(cand.keySecret, cand.providerId, cand.keyName);
+        if (attempt > 0) {
+          sendToRenderer('chat:voice-progress', {
+            sessionId,
+            type: 'routing',
+            taskType,
+            modelId: cand.modelId,
+            providerId: cand.providerId,
+            statusText: `Routing via ${cand.modelId}...`,
+          });
+        }
+
+        const provider = providerManager.getProviderForKeyProfile(cand.providerId, cand.keySecret);
+        if (provider) {
+          provider.updateConfig({
+            apiKey: cand.keySecret,
+            ...(profile.baseUrl ? { baseUrl: profile.baseUrl } : {}),
+          });
+        }
+        const targetProviderKey = provider ? provider.getId() : cand.providerId;
+        const isLargerModel = /\b(pro|sonnet|opus|gpt-4o|gpt-4\.1|gpt-5|o3|70b|72b|r1)\b/i.test(cand.modelId);
+        const firstByteTimeoutMs = attempt + 1 < maxAttempts ? (isLargerModel ? 11500 : 8500) : 20000;
+        const attemptCtrl = new AbortController();
+        const onParentAbort = () => attemptCtrl.abort();
+        abortController.signal.addEventListener('abort', onParentAbort, { once: true });
+        let attemptTimedOut = false;
+        let attemptTimer = setTimeout(() => {
+          attemptTimedOut = true;
+          attemptCtrl.abort();
+        }, firstByteTimeoutMs);
+        const touchWatchdog = () => {
+          clearTimeout(attemptTimer);
+          attemptTimer = setTimeout(() => {
+            attemptTimedOut = true;
+            attemptCtrl.abort();
+          }, 12000);
+        };
+
+        try {
+          let streamedContent = '';
+          let streamedUsage: any = undefined;
+          let receivedAnyChunk = false;
+          let streamErroredBeforeContent = false;
+
+          try {
+            await new Promise<void>((resolve, reject) => {
+              let settled = false;
+              const finish = (err?: any) => {
+                if (settled) return;
+                settled = true;
+                if (err) reject(err);
+                else resolve();
+              };
+
+              providerManager
+                .streamComplete(
+                  targetProviderKey,
+                  {
+                    model: cand.modelId,
+                    messages: history,
+                    systemPrompt: voiceSystemPrompt,
+                    maxTokens: 1024,
+                    signal: attemptCtrl.signal,
+                  },
+                  {
+                    onReasoning: () => {
+                      if (!attemptCtrl.signal.aborted) touchWatchdog();
+                    },
+                    onContent: (delta: string) => {
+                      if (!delta || attemptCtrl.signal.aborted) return;
+                      touchWatchdog();
+                      receivedAnyChunk = true;
+                      streamedContent += delta;
+                      sendToRenderer('chat:voice-progress', {
+                        sessionId,
+                        type: 'chunk',
+                        content: streamedContent,
+                        modelId: cand.modelId,
+                        providerId: cand.providerId,
+                      });
+                    },
+                    onDone: (u: any) => {
+                      if (u) streamedUsage = u;
+                      finish();
+                    },
+                    onError: (err: Error) => {
+                      finish(err);
+                    },
+                  }
+                )
+                .then(() => finish())
+                .catch(finish);
+            });
+          } catch (streamErr: any) {
+            if (!receivedAnyChunk && !attemptTimedOut && !abortController.signal.aborted && !isQuotaOrModelUnavailableError(streamErr)) {
+              streamErroredBeforeContent = true;
+            } else {
+              throw streamErr;
+            }
+          }
+
+          const stripSpeaker = (s: string) =>
+            (s || '').replace(/^\s*(?:\*{0,2}(?:AI\s*Assistant|Assistant|EXCO(?:\s+AI)?|Model|Bot)\*{0,2}\s*[:\-–—]\s*)+/i, '').trim();
+
+          let finalModelId = cand.modelId;
+          if (streamErroredBeforeContent || (!receivedAnyChunk && !streamedContent.trim())) {
+            const response = await providerManager.complete(targetProviderKey, {
+              model: cand.modelId,
+              messages: history,
+              systemPrompt: voiceSystemPrompt,
+              maxTokens: 1024,
+              signal: attemptCtrl.signal,
+            });
+            assistantText = stripSpeaker(response.content || '');
+            tokens = response.usage;
+            finalModelId = response.model || cand.modelId;
+          } else {
+            assistantText = stripSpeaker(streamedContent);
+            tokens = streamedUsage;
+          }
+
+          if (!assistantText || assistantText === '""') {
+            throw new Error(`Empty response from ${cand.modelId}`);
+          }
+
+          if (!tokens || !tokens.totalTokens) {
+            const estIn = Math.max(1, Math.ceil(userText.length / 4));
+            const estOut = Math.max(1, Math.ceil(assistantText.length / 4));
+            tokens = { inputTokens: estIn, outputTokens: estOut, totalTokens: estIn + estOut };
+          }
+
+          if (attempt > 0) failoverCount = attempt;
+          usedModelId = finalModelId;
+          usedProviderId = cand.providerId;
+          // Lock this working model for the rest of the Voice Chat session
+          activeVoiceStickyModels.set(sessionId, {
+            requestedModel,
+            requestedKeyId,
+            lockedCandidate: cand,
+            orderedBackups: candidatesToTry.filter(c => !(c.keyId === cand.keyId && c.modelId === cand.modelId)),
+            updatedAt: Date.now(),
+          });
+          break;
+        } catch (err: any) {
+          if (attemptTimedOut && !abortController.signal.aborted) {
+            err = new Error(`Model ${cand.modelId} timed out`);
+          }
+          if (abortController.signal.aborted || (err?.name === 'AbortError' && !attemptTimedOut)) {
+            return { aborted: true, assistantText: '', modelId: usedModelId, providerId: usedProviderId };
+          }
+          const errText = err instanceof Error ? err.message : String(err || 'Unknown error');
+          lastErrorMsg = errText;
+          console.warn(`[VoiceTurn] ${cand.modelId} (${cand.providerId}) failed: ${errText}`);
+          if (isAuthError(err)) {
+            failedVoiceAuthKeys.add(cand.keyId);
+            markKeyAuthFailed(cand.keyId, errText);
+          } else {
+            markModelExhausted(cand.keyId, cand.modelId, errText);
+          }
+          const hasNext = candidatesToTry.slice(attempt + 1).some(c => !failedVoiceAuthKeys.has(c.keyId));
+          if ((isQuotaOrModelUnavailableError(err) || input.preferredFailover !== false) && hasNext) {
+            continue;
+          }
+          return {
+            assistantText: '',
+            modelId: cand.modelId,
+            providerId: cand.providerId,
+            error: errText,
+          };
+        } finally {
+          clearTimeout(attemptTimer);
+          abortController.signal.removeEventListener('abort', onParentAbort);
+        }
+      }
+
+      if (!assistantText) {
+        return {
+          assistantText: '',
+          modelId: usedModelId,
+          providerId: usedProviderId,
+          error: lastErrorMsg || 'All routed voice models returned empty responses.',
+        };
+      }
+
+      sendToRenderer('chat:voice-progress', {
+        sessionId,
+        type: 'done',
+        modelId: usedModelId,
+        providerId: usedProviderId,
+        taskType,
+        overviewerModelId: overviewerModelIdUsed,
+      });
+
+      return {
+        assistantText: assistantText.trim(),
+        modelId: usedModelId,
+        providerId: usedProviderId,
+        tokens,
+        overviewerModelId: overviewerModelIdUsed,
+        failoverCount,
+      };
+    } finally {
+      if (activeVoiceAbortControllers.get(sessionId) === abortController) {
+        activeVoiceAbortControllers.delete(sessionId);
+      }
+    }
+  });
+
+  ipcMain.handle('chat:cancel-voice', async (_event, sessionId: string) => {
+    if (!sessionId) return;
+    activeVoiceStickyModels.delete(sessionId);
+    const ctrl = activeVoiceAbortControllers.get(sessionId);
+    if (ctrl) {
+      try { ctrl.abort(); } catch {}
+      activeVoiceAbortControllers.delete(sessionId);
+    }
+  });
+
+  ipcMain.handle('chat:save-voice-session', async (_event, input: {
+    conversationId?: string;
+    payload: VoiceSessionPayload;
+    modelId?: string;
+    providerId?: string;
+  }) => {
+    const payload = input?.payload;
+    if (!payload || !Array.isArray(payload.entries)) {
+      throw new Error('Invalid voice session payload');
+    }
+
+    let targetConvId = input.conversationId;
+    let createdConversation: Conversation | null = null;
+
+    if (!targetConvId || !getConversation(targetConvId)) {
+      const firstUser = payload.entries.find(e => e.role === 'user')?.text?.trim();
+      const title = firstUser ? `Voice: ${firstUser.slice(0, 42)}` : 'Voice Chat';
+      createdConversation = createConversation({
+        title,
+        modelId: input.modelId || 'auto',
+        providerId: input.providerId || 'auto',
+      });
+      targetConvId = createdConversation.id;
+    }
+
+    const serialized = serializeVoiceSession(payload);
+    const primaryModel = payload.modelsUsed?.[0] || input.modelId || 'voice-chat';
+    const message = createMessage({
+      conversationId: targetConvId,
+      role: 'assistant',
+      content: serialized,
+      modelId: primaryModel,
+      providerId: input.providerId || 'auto',
+      status: 'complete',
+    });
+
+    return {
+      conversationId: targetConvId,
+      conversation: createdConversation,
+      message,
+    };
+  });
+
+  ipcMain.handle('chat:list-system-voices', async () => {
+    if (process.platform !== 'win32') return [];
+    const execFileAsync = promisify(execFile);
+    try {
+      const psScript = [
+        'Add-Type -AssemblyName System.Speech',
+        '$s = New-Object System.Speech.Synthesis.SpeechSynthesizer',
+        '$voices = $s.GetInstalledVoices() | ForEach-Object { @{ name = $_.VoiceInfo.Name; culture = $_.VoiceInfo.Culture.Name } }',
+        '$s.Dispose()',
+        '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
+        'ConvertTo-Json -InputObject @($voices) -Compress',
+      ].join('; ');
+      const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psScript], {
+        timeout: 8000,
+      });
+      const parsed = JSON.parse((stdout || '[]').trim() || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  });
+
+  ipcMain.handle('chat:warm-tts', async (_event, voiceName?: string) => {
+    // Also pre-warm the model router pool in background so Turn 1 selection hits 0ms cache
+    collectAllModelCandidates(getApiKeys(), resolveKeySecretForRouter).catch(() => {});
+    return warmEdgeTtsClient(voiceName);
+  });
+
+  ipcMain.handle('chat:synthesize-speech', async (_event, input: {
+    text: string;
+    engine?: 'edge-neural' | 'system';
+    voice?: string;
+    speed?: number;
+    pitch?: number;
+    keyId?: string;
+  }) => {
+    const text = (input?.text || '').trim();
+    if (!text) return { error: 'Empty text' };
+
+    const requestedEngine = input?.engine === 'system' ? 'system' : 'edge-neural';
+    const requestedVoice = (input?.voice || 'en-US-JennyNeural').trim();
+    const cacheKey = text.length <= 280 ? `${requestedEngine}::${requestedVoice}::${text}` : '';
+    if (cacheKey) {
+      const cached = getCachedTtsAudio(cacheKey);
+      if (cached) {
+        return cached;
+      }
+    }
+
+    // 1. Primary Microsoft Edge Neural Voice (msedge-tts)
+    if (requestedEngine === 'edge-neural') {
+      const edgeResult = await runEdgeTtsSynthesis(text, requestedVoice);
+      if (edgeResult) {
+        if (cacheKey) setCachedTtsAudio(cacheKey, edgeResult);
+        return edgeResult;
+      }
+    }
+
+    // 2. Last-resort offline Windows System.Speech WAV synthesis
+    if (process.platform === 'win32') {
+      const execFileAsync = promisify(execFile);
+      const psScript = [
+        'Add-Type -AssemblyName System.Speech',
+        '$s = New-Object System.Speech.Synthesis.SpeechSynthesizer',
+        'try { if ($env:EXCO_TTS_VOICE) { $s.SelectVoice($env:EXCO_TTS_VOICE) } } catch {}',
+        '$s.Rate = 2',
+        '$ms = New-Object System.IO.MemoryStream',
+        '$s.SetOutputToWaveStream($ms)',
+        '$s.Speak($env:EXCO_TTS_TEXT)',
+        '$b64 = [Convert]::ToBase64String($ms.ToArray())',
+        '$s.Dispose()',
+        '$ms.Dispose()',
+        'Write-Output $b64',
+      ].join('; ');
+      try {
+        const { stdout } = await execFileAsync(
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-Command', psScript],
+          {
+            timeout: 20000,
+            maxBuffer: 25 * 1024 * 1024,
+            env: {
+              ...process.env,
+              EXCO_TTS_TEXT: text.slice(0, 4000),
+              EXCO_TTS_VOICE: (input?.voice || '').trim(),
+            },
+          }
+        );
+        const audioBase64 = (stdout || '').trim();
+        if (audioBase64) {
+          return {
+            audioBase64,
+            mimeType: 'audio/wav',
+            source: 'windows-sapi',
+          };
+        }
+      } catch (err: any) {
+        return { error: err?.message || 'Speech synthesis failed' };
+      }
+    }
+
+    return { error: 'Use browser speech synthesis fallback' };
   });
 }
 
@@ -1250,41 +2229,133 @@ export function registerChatHandlers(): void {
 // Provider Handlers
 // ============================================================================
 
+const providerModelProbeAt = new Map<string, number>();
+
+async function extractAndPersistProviderModels(provider: AIProvider): Promise<AIProvider> {
+  if (!provider) return provider;
+  try {
+    const keys = getApiKeys();
+    const resolveKeySecret = async (entry: ApiKeyEntry): Promise<string | null> => {
+      const k = await getStoredApiKey(entry.providerId, entry.keyName);
+      if (k) return k;
+      if (entry.encryptedKey && !entry.encryptedKey.startsWith('encrypted:')) {
+        try {
+          return await decrypt(entry.encryptedKey);
+        } catch {}
+      }
+      return null;
+    };
+
+    let secret = provider.config?.apiKey || '';
+    if (!secret) {
+      const matchingKey = keys.find(
+        k => k.keyName.trim().toLowerCase() === provider.name.trim().toLowerCase() || k.providerId === provider.type
+      );
+      if (matchingKey) {
+        secret = (await resolveKeySecret(matchingKey)) || '';
+      }
+    }
+
+    const hintProfile = resolveApiKeyProfile(secret, provider.type, provider.name);
+    const resolvedBaseUrl = provider.config?.baseUrl?.trim() || hintProfile.baseUrl || '';
+
+    providerManager.registerConfiguredProvider(provider);
+    const instance =
+      providerManager.getProvider(provider.id) ||
+      providerManager.getProviderForKeyProfile(provider.type, secret || undefined);
+    if (!instance) return provider;
+
+    instance.updateConfig({
+      ...(secret ? { apiKey: secret } : {}),
+      ...(resolvedBaseUrl ? { baseUrl: resolvedBaseUrl } : {}),
+    });
+
+    const fetched = await Promise.race<any[]>([
+      instance.listModels(),
+      new Promise<any[]>(resolve => setTimeout(() => resolve([]), 4500)),
+    ]);
+
+    const modelsToSave = Array.isArray(fetched) && fetched.length > 0 ? fetched : provider.models || [];
+    const baseImproved = !provider.config?.baseUrl && resolvedBaseUrl;
+    if ((Array.isArray(fetched) && fetched.length > 0) || baseImproved) {
+      const updated = updateProvider(provider.id, {
+        models: modelsToSave,
+        ...(baseImproved ? { config: { ...provider.config, baseUrl: resolvedBaseUrl } } : {}),
+      });
+      if (updated) {
+        providerManager.registerConfiguredProvider(updated);
+        return updated;
+      }
+    }
+  } catch {}
+  return provider;
+}
+
+let lastProvidersSyncAt = 0;
+let lastKeysSyncAt = 0;
+
 export function registerProviderHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.PROVIDERS_LIST, async () => {
-    const allKeys = getApiKeys();
-    for (const kEntry of allKeys) {
-      try {
-        let secret = await getStoredApiKey(kEntry.providerId, kEntry.keyName);
-        if (!secret && kEntry.encryptedKey && !kEntry.encryptedKey.startsWith('encrypted:')) {
-          secret = await decrypt(kEntry.encryptedKey).catch(() => null);
+    const now = Date.now();
+    if (now - lastProvidersSyncAt > 30_000) {
+      lastProvidersSyncAt = now;
+      // Run key-to-provider sync & empty-model extraction asynchronously so UI never stalls
+      void (async () => {
+        const allKeys = getApiKeys();
+        for (const kEntry of allKeys) {
+          try {
+            let secret = await getStoredApiKey(kEntry.providerId, kEntry.keyName);
+            if (!secret && kEntry.encryptedKey && !kEntry.encryptedKey.startsWith('encrypted:')) {
+              secret = await decrypt(kEntry.encryptedKey).catch(() => null);
+            }
+            if (secret) {
+              await ensureProviderForKey(secret, kEntry.providerId, kEntry.keyName, false);
+            }
+          } catch {}
         }
-        if (secret) {
-          await ensureProviderForKey(secret, kEntry.providerId, kEntry.keyName, false);
+
+        const emptyEnabled = getProviders().filter(
+          p => p.enabled && (!Array.isArray(p.models) || p.models.length === 0) &&
+            (!providerModelProbeAt.has(p.id) || Date.now() - (providerModelProbeAt.get(p.id) || 0) > 45000)
+        );
+        if (emptyEnabled.length > 0) {
+          await Promise.all(
+            emptyEnabled.map(p => {
+              providerModelProbeAt.set(p.id, Date.now());
+              return extractAndPersistProviderModels(p);
+            })
+          );
         }
-      } catch {}
+      })();
     }
+
     return getProviders().map(sanitizeProviderForIpc);
   });
 
   ipcMain.handle(IPC_CHANNELS.PROVIDERS_CREATE, async (_event, input) => {
+    invalidateCandidatePoolCache();
     const validated = validateInput(createProviderInputSchema, input);
     const created = createProvider(validated as any);
     providerManager.registerConfiguredProvider(created);
-    return sanitizeProviderForIpc(created);
+    const populated = await extractAndPersistProviderModels(created);
+    return sanitizeProviderForIpc(populated);
   });
 
   ipcMain.handle(IPC_CHANNELS.PROVIDERS_UPDATE, async (_event, { id, updates }) => {
+    invalidateCandidatePoolCache();
     const validated = validateInput(updateProviderInputSchema, { id, updates });
     const updated = updateProvider(validated.id, validated.updates as any);
     if (updated) {
       providerManager.registerConfiguredProvider(updated);
-      return sanitizeProviderForIpc(updated);
+      const needsExtract = updated.enabled && (!Array.isArray(updated.models) || updated.models.length === 0 || Boolean(updates?.config));
+      const finalProvider = needsExtract ? await extractAndPersistProviderModels(updated) : updated;
+      return sanitizeProviderForIpc(finalProvider);
     }
     return updated;
   });
 
   ipcMain.handle(IPC_CHANNELS.PROVIDERS_DELETE, async (_event, id) => {
+    invalidateCandidatePoolCache();
     providerManager.unregisterProvider(id);
     return deleteProvider(id);
   });
@@ -1294,14 +2365,15 @@ export function registerProviderHandlers(): void {
     if (!provider) return { success: false, error: 'Provider not found' };
 
     try {
-      providerManager.registerConfiguredProvider(provider);
-      const instance = providerManager.getProvider(provider.id);
+      const refreshed = await extractAndPersistProviderModels(provider);
+      providerManager.registerConfiguredProvider(refreshed);
+      const instance = providerManager.getProvider(refreshed.id);
       if (!instance) return { success: false, error: 'Provider could not be initialized' };
 
       // Attach a matching saved API key if one exists for this provider type
       const keys = getApiKeys();
-      const matchingKey = keys.find(k => k.keyName === provider.name || k.providerId === provider.type);
-      if (matchingKey && !provider.config?.apiKey) {
+      const matchingKey = keys.find(k => k.keyName === refreshed.name || k.providerId === refreshed.type);
+      if (matchingKey && !refreshed.config?.apiKey) {
         let secret = await getStoredApiKey(matchingKey.providerId, matchingKey.keyName);
         if (!secret && matchingKey.encryptedKey && !matchingKey.encryptedKey.startsWith('encrypted:')) {
           secret = await decrypt(matchingKey.encryptedKey).catch(() => null);
@@ -1507,6 +2579,9 @@ export function registerProviderHandlers(): void {
     if (!instance) return dbProvider?.models || [];
     try {
       const models = await instance.listModels();
+      if (dbProvider && Array.isArray(models) && models.length > 0 && (!dbProvider.models || dbProvider.models.length === 0)) {
+        updateProvider(dbProvider.id, { models });
+      }
       return models.map(m => {
         const cap = m.contextWindow && m.contextWindow > 0 ? m.contextWindow : 128000;
         return {
@@ -1671,24 +2746,29 @@ export function registerProviderHandlers(): void {
 export function registerApiKeyHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.KEYS_LIST, async () => {
     const keys = getApiKeys();
-    // Auto-populate missing AI providers in the background so initial UI load never blocks on network probes
-    void (async () => {
-      for (const entry of keys) {
-        try {
-          let secret = await getStoredApiKey(entry.providerId, entry.keyName);
-          if (!secret && entry.encryptedKey && !entry.encryptedKey.startsWith('encrypted:')) {
-            secret = await decrypt(entry.encryptedKey).catch(() => null);
-          }
-          if (secret) {
-            await ensureProviderForKey(secret, entry.providerId, entry.keyName, false);
-          }
-        } catch {}
-      }
-    })();
+    const now = Date.now();
+    // Auto-populate missing AI providers in the background (throttled so deletes/refreshes stay instant)
+    if (now - lastKeysSyncAt > 30_000) {
+      lastKeysSyncAt = now;
+      void (async () => {
+        for (const entry of keys) {
+          try {
+            let secret = await getStoredApiKey(entry.providerId, entry.keyName);
+            if (!secret && entry.encryptedKey && !entry.encryptedKey.startsWith('encrypted:')) {
+              secret = await decrypt(entry.encryptedKey).catch(() => null);
+            }
+            if (secret) {
+              await ensureProviderForKey(secret, entry.providerId, entry.keyName, false);
+            }
+          } catch {}
+        }
+      })();
+    }
     return keys.map(sanitizeApiKeyForIpc);
   });
 
   ipcMain.handle(IPC_CHANNELS.KEYS_CREATE, async (_event, input) => {
+    invalidateCandidatePoolCache();
     const validated = validateInput(createApiKeyInputSchema, input);
     const { profile } = await ensureProviderForKey(validated.key, validated.providerId, validated.keyName, true);
     const resolvedProviderId = profile.providerId;
@@ -1708,21 +2788,34 @@ export function registerApiKeyHandlers(): void {
   });
 
   ipcMain.handle(IPC_CHANNELS.KEYS_DELETE, async (_event, id) => {
+    invalidateCandidatePoolCache();
     const entry = getApiKey(id);
+    const deleted = deleteApiKey(id);
+
     if (entry) {
-      await deleteStoredApiKey(entry.providerId, entry.keyName);
+      const normalizedKeyName = (entry.keyName || '').trim().toLowerCase();
       // Clean up auto-created AI provider matching this deleted key's name
       const remaining = getApiKeys().filter(k => k.id !== id);
-      const stillReferenced = remaining.some(k => k.keyName === entry.keyName && k.providerId === entry.providerId);
+      const stillReferenced = remaining.some(
+        k => (k.keyName || '').trim().toLowerCase() === normalizedKeyName && k.providerId === entry.providerId
+      );
       if (!stillReferenced) {
-        const autoProv = getProviders().find(p => p.name === entry.keyName && p.type === entry.providerId);
+        const autoProv = getProviders().find(
+          p => (p.name || '').trim().toLowerCase() === normalizedKeyName && p.type === entry.providerId
+        );
         if (autoProv) {
           providerManager.unregisterProvider(autoProv.id);
           deleteProvider(autoProv.id);
         }
       }
+
+      // Clean OS keychain / fallback store without blocking or throwing on locked/missing vault entries
+      void Promise.race([
+        deleteStoredApiKey(entry.providerId, entry.keyName).catch(() => false),
+        new Promise<void>(resolve => setTimeout(resolve, 1500)),
+      ]);
     }
-    return deleteApiKey(id);
+    return deleted;
   });
 
   ipcMain.handle(IPC_CHANNELS.KEYS_VALIDATE, async (_event, id) => {

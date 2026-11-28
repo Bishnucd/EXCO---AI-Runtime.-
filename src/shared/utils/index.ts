@@ -192,9 +192,13 @@ function canonicalizePosixPath(input: string): string {
 }
 
 export function isPathWithin(root: string, target: string): boolean {
-  const cmpRoot = canonicalizePosixPath(root);
-  const cmpTarget = canonicalizePosixPath(target);
+  let cmpRoot = canonicalizePosixPath(root);
+  let cmpTarget = canonicalizePosixPath(target);
   if (!cmpRoot || !cmpTarget) return false;
+  if (/^[a-z]:\//i.test(cmpRoot) || /^[a-z]:\//i.test(cmpTarget)) {
+    cmpRoot = cmpRoot.toLowerCase();
+    cmpTarget = cmpTarget.toLowerCase();
+  }
   return cmpTarget === cmpRoot || cmpTarget.startsWith(cmpRoot + '/');
 }
 
@@ -882,11 +886,15 @@ const HINT_PROFILES: Array<{ keywords: string[]; profile: ApiKeyProfile }> = [
   },
   {
     keywords: ['aion'],
-    profile: { providerId: 'custom', displayName: 'Aion', baseUrl: '', tier: 'free' },
+    profile: { providerId: 'custom', displayName: 'Aion Labs', baseUrl: 'https://api.aionlabs.ai/v1', defaultModel: 'aion-labs/aion-3.5', tier: 'free' },
   },
   {
     keywords: ['parallel'],
-    profile: { providerId: 'custom', displayName: 'Parallel', baseUrl: '', tier: 'free' },
+    profile: { providerId: 'custom', displayName: 'Parallel AI', baseUrl: 'https://api.parallel.ai/v1', defaultModel: 'parallel', tier: 'free' },
+  },
+  {
+    keywords: ['llm7'],
+    profile: { providerId: 'custom', displayName: 'LLM7 Gateway', baseUrl: 'https://api.llm7.io/v1', defaultModel: 'default', tier: 'free' },
   },
   {
     keywords: ['cohere'],
@@ -960,7 +968,8 @@ export function inferModelTier(
     displayLower.includes('kilo') ||
     displayLower.includes('aion') ||
     displayLower.includes('parallel') ||
-    displayLower.includes('cloudflare')
+    displayLower.includes('cloudflare') ||
+    displayLower.includes('llm7')
   ) {
     return 'free';
   }
@@ -1116,3 +1125,5 @@ export const utils = {
   round,
   randomInt,
 };
+
+export * from './voiceSession';

@@ -64,7 +64,62 @@ const chatApi = {
   streamMessage: createInvoke<{ conversationId: string; content: string | any[]; modelId: string }, AsyncIterable<StreamChunk>>('chat:stream-message'),
   cancelStream: createInvoke<string, void>('chat:cancel-stream'),
   regenerateMessage: createInvoke<string, Message>('chat:regenerate-message'),
-  transcribeAudio: createInvoke<{ wavBase64: string; keyId?: string }, { text: string; source: string; error?: string }>('chat:transcribe-audio'),
+  transcribeAudio: createInvoke<{ wavBase64: string; keyId?: string; preferredEngine?: 'auto' | 'gemini' | 'openai-whisper' | 'windows-speech'; language?: string }, { text: string; source: string; error?: string }>('chat:transcribe-audio'),
+  voiceTurn: createInvoke<{
+    sessionId: string;
+    conversationId?: string;
+    userText: string;
+    voiceHistory: Array<{ role: 'user' | 'assistant'; text: string }>;
+    modelId?: string;
+    providerId?: string;
+    keyId?: string;
+    preferredFailover?: boolean;
+    workflowMode?: 'auto' | 'turbo' | 'standard' | 'deep-thought';
+    skillContext?: string;
+    language?: string;
+  }, {
+    aborted?: boolean;
+    assistantText: string;
+    modelId: string;
+    providerId: string;
+    tokens?: { inputTokens: number; outputTokens: number; totalTokens: number };
+    overviewerModelId?: string;
+    failoverCount?: number;
+    error?: string;
+  }>('chat:voice-turn'),
+  cancelVoiceTurn: createInvoke<string, void>('chat:cancel-voice'),
+  saveVoiceSession: createInvoke<{
+    conversationId?: string;
+    payload: import('@shared/types').VoiceSessionPayload;
+    modelId?: string;
+    providerId?: string;
+  }, {
+    conversationId: string;
+    conversation: Conversation | null;
+    message: Message;
+  }>('chat:save-voice-session'),
+  synthesizeSpeech: createInvoke<{
+    text: string;
+    engine?: 'edge-neural' | 'system';
+    voice?: string;
+    speed?: number;
+    pitch?: number;
+    keyId?: string;
+  }, { audioBase64?: string; mimeType?: string; source?: string; warning?: string; error?: string }>('chat:synthesize-speech'),
+  warmTts: createInvoke<string | void, boolean>('chat:warm-tts'),
+  listSystemVoices: createInvoke<void, Array<{ name: string; culture: string }>>('chat:list-system-voices'),
+  onVoiceProgress: (listener: (ev: {
+    sessionId: string;
+    type: 'routing' | 'status' | 'chunk' | 'done';
+    statusText?: string;
+    content?: string;
+    modelId?: string;
+    providerId?: string;
+    taskType?: string;
+    overviewerModelId?: string;
+  }) => void) => {
+    return createOn('chat:voice-progress', listener);
+  },
   onChatProgress: (listener: (ev: { conversationId: string; type: 'routing' | 'status' | 'chunk' | 'done'; statusText?: string; content?: string; modelId?: string; providerId?: string; taskType?: string; overviewerModelId?: string }) => void) => {
     return createOn('chat:live-progress', listener);
   },
@@ -244,6 +299,7 @@ const workAgentApi = {
     accessLevel: 'ask' | 'selected-folder' | 'full-access';
     skillContext?: string;
   }, { conversationId: string; userMessage: any; assistantMessage: any; steps: any[] }>('work:run-agent'),
+  listConversations: createInvoke<void, Conversation[]>('work:list-conversations'),
   approveAction: createInvoke<{ runId: string; stepId: string; decision: 'allow-once' | 'allow-run' | 'deny' }, boolean>('work:approve-action'),
   cancelAgent: createInvoke<string, boolean>('work:cancel-agent'),
   onAgentEvent: (listener: (data: any) => void) => {

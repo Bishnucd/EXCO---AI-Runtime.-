@@ -350,8 +350,60 @@ const WorkMode: React.FC = () => {
       }
     };
     window.addEventListener('exco:project-deleted', handleProjectDeleted as EventListener);
+
+    const handleSelectWorkConv = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ projectId?: string; conversationId?: string }>).detail;
+      const currentProjectId = useWorkspaceStore.getState().activeProjectId;
+      if (!detail || (detail.projectId && detail.projectId !== currentProjectId)) return;
+      const targetProjId = detail.projectId || currentProjectId;
+      if (!detail.conversationId) {
+        if (targetProjId) localStorage.removeItem(`exco:work-conv:${targetProjId}`);
+        setWorkConvId(undefined);
+        setMessages([]);
+        setLiveSteps([]);
+        return;
+      }
+      if (targetProjId) localStorage.setItem(`exco:work-conv:${targetProjId}`, detail.conversationId);
+      setWorkConvId(detail.conversationId);
+      window.exco.chat.getMessages(detail.conversationId).then(msgs => {
+        if (Array.isArray(msgs)) {
+          setMessages(
+            msgs.map(m => ({
+              ...m,
+              steps: Array.isArray(m.toolCalls)
+                ? m.toolCalls.map((tc: any) => ({
+                    id: tc.id,
+                    tool: tc.name,
+                    args: tc.arguments || {},
+                    thought: tc.arguments?.__thought,
+                    major: Boolean(tc.arguments?.__major),
+                    status: tc.status === 'error' ? (String(tc.result || '').includes('denied') ? 'denied' : 'error') : 'completed',
+                    output: tc.result,
+                    error: tc.error,
+                  }))
+                : undefined,
+            }))
+          );
+        }
+      }).catch(() => {});
+    };
+
+    const handleWorkConvDeleted = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ projectId?: string; conversationId?: string }>).detail;
+      if (detail?.conversationId && detail.conversationId === workConvId) {
+        if (activeProjectId) localStorage.removeItem(`exco:work-conv:${activeProjectId}`);
+        setWorkConvId(undefined);
+        setMessages([]);
+        setLiveSteps([]);
+      }
+    };
+
+    window.addEventListener('exco:work-select-conversation', handleSelectWorkConv as EventListener);
+    window.addEventListener('exco:work-conv-deleted', handleWorkConvDeleted as EventListener);
     return () => {
       window.removeEventListener('exco:project-deleted', handleProjectDeleted as EventListener);
+      window.removeEventListener('exco:work-select-conversation', handleSelectWorkConv as EventListener);
+      window.removeEventListener('exco:work-conv-deleted', handleWorkConvDeleted as EventListener);
     };
   }, [activeProjectId, workConvId]);
 
@@ -776,6 +828,7 @@ const WorkMode: React.FC = () => {
         setWorkConvId(response.conversationId);
         localStorage.setItem(`exco:work-conv:${expectedProjectId}`, response.conversationId);
         await setProjectConversationId(expectedProjectId, response.conversationId);
+        window.dispatchEvent(new CustomEvent('exco:work-conversations-updated'));
       }
 
       if (response?.userMessage && response?.assistantMessage) {

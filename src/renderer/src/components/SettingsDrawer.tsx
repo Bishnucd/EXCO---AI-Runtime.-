@@ -3,12 +3,17 @@
  * Compact, user-friendly slide-out settings panel with General and Appearance tabs
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   X,
   Palette,
   User,
   RotateCcw,
+  Volume2,
+  Play,
+  Square,
+  Mic,
+  Sliders,
 } from 'lucide-react';
 import { cn } from '@shared/utils';
 import { useSettingsStore } from '../stores/settingsStore';
@@ -29,6 +34,18 @@ import type { Settings } from '@shared/types';
 import { DEFAULT_SETTINGS } from '@shared/constants';
 import { VisualOverlay } from './VisualOverlay';
 import { InfoTip } from './InfoTip';
+import {
+  useVoiceSettingsStore,
+  VOICE_MODULE_PRESETS,
+  VOICE_PREVIEW_SENTENCE,
+  getInstantVoicePreviewAudio,
+  resolveVoiceForModule,
+  stopAllVoiceAudio,
+  playExclusiveAudioBase64,
+  setLiveVoicePlaybackSpeed,
+  type SpeechRecognitionEngine,
+  type MicSensitivity,
+} from '../stores/voiceSettingsStore';
 
 interface SettingsDrawerProps {
   onClose: () => void;
@@ -38,6 +55,7 @@ interface SettingsDrawerProps {
 const TABS = [
   { id: 'general', label: 'General', icon: User },
   { id: 'appearance', label: 'Appearance', icon: Palette },
+  { id: 'voice', label: 'Voice', icon: Volume2 },
 ] as const;
 
 function isSupportedImageFile(file: File): boolean {
@@ -95,9 +113,18 @@ export function SettingsDrawer({ onClose, initialTab }: SettingsDrawerProps) {
   );
   const [imageFormatPopup, setImageFormatPopup] = useState<{ fileName: string } | null>(null);
   const globalWallpaperInputRef = React.useRef<HTMLInputElement>(null);
-  const [activeTab, setActiveTab] = useState<'general' | 'appearance'>(
-    initialTab === 'appearance' ? 'appearance' : 'general'
+  const [activeTab, setActiveTab] = useState<'general' | 'appearance' | 'voice'>(
+    initialTab === 'appearance' ? 'appearance' : initialTab === 'voice' ? 'voice' : 'general'
   );
+  const voiceSettings = useVoiceSettingsStore();
+  const [testingVoice, setTestingVoice] = useState(false);
+  const sampleTokenRef = React.useRef(0);
+
+  useEffect(() => {
+    if (voiceSettings.voiceModule === 'edge-neural') {
+      window.exco.chat.warmTts?.(voiceSettings.edgeVoice).catch(() => {});
+    }
+  }, [voiceSettings.voiceModule, voiceSettings.edgeVoice]);
   const [statusNotice, setStatusNotice] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   const showNotice = (type: 'success' | 'error', text: string) => {
@@ -557,12 +584,295 @@ export function SettingsDrawer({ onClose, initialTab }: SettingsDrawerProps) {
     );
   };
 
+  const stopSamplePlayback = () => {
+    sampleTokenRef.current += 1;
+    stopAllVoiceAudio();
+    setTestingVoice(false);
+  };
+
+  const playVoiceSample = async () => {
+    const audioToken = stopAllVoiceAudio();
+    const uiToken = ++sampleTokenRef.current;
+    const latest = useVoiceSettingsStore.getState();
+
+    setTestingVoice(true);
+    try {
+      // Pre-built single-sentence preview per Edge Neural voice plays in <1ms with zero network wait
+      const prebuiltBase64 = getInstantVoicePreviewAudio(latest.edgeVoice);
+      if (prebuiltBase64) {
+        await playExclusiveAudioBase64(
+          prebuiltBase64,
+          'audio/mpeg',
+          latest.voiceSpeed || 1.0,
+          audioToken
+        );
+        if (sampleTokenRef.current === uiToken) {
+          setTestingVoice(false);
+        }
+        return;
+      }
+
+      const res = await window.exco.chat.synthesizeSpeech({
+        text: VOICE_PREVIEW_SENTENCE,
+        engine: latest.voiceModule,
+        voice: resolveVoiceForModule(latest),
+        speed: latest.voiceSpeed,
+        pitch: latest.voicePitch,
+      });
+      if (sampleTokenRef.current !== uiToken) return;
+      if (res?.audioBase64) {
+        await playExclusiveAudioBase64(
+          res.audioBase64,
+          res.mimeType || 'audio/mpeg',
+          useVoiceSettingsStore.getState().voiceSpeed || 1.0,
+          audioToken
+        );
+        if (sampleTokenRef.current === uiToken) {
+          setTestingVoice(false);
+        }
+        return;
+      }
+      if (res?.error) {
+        showNotice('error', res.error);
+      }
+      if (sampleTokenRef.current === uiToken) {
+        setTestingVoice(false);
+      }
+    } catch {
+      if (sampleTokenRef.current === uiToken) setTestingVoice(false);
+    }
+  };
+
+  const handleTestVoiceModule = async () => {
+    if (testingVoice) {
+      stopSamplePlayback();
+      return;
+    }
+    await playVoiceSample();
+  };
+
+  const renderVoiceTab = () => (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs font-semibold uppercase tracking-wider text-[rgb(var(--color-foreground-muted))]">
+          Voice Modules & Audio Settings
+        </span>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={handleTestVoiceModule}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-sky-500/40 bg-sky-500/15 text-sky-400 hover:bg-sky-500/25"
+          >
+            {testingVoice ? <Square className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+            <span>{testingVoice ? 'Stop Preview' : 'Test Voice'}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              voiceSettings.resetVoiceSettings();
+              showNotice('success', 'Voice settings reset to defaults.');
+            }}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-[rgb(var(--color-border))] text-[rgb(var(--color-foreground))] hover:bg-[rgb(var(--color-surface-hover))]"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span>Reset</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Voice Output Modules */}
+      <section className="rounded-xl border border-[rgb(var(--color-border))] bg-[rgb(var(--color-surface))] p-4 space-y-3 shadow-sm">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5">
+            <Volume2 className="w-4 h-4 text-sky-400" />
+            <span className="text-sm font-semibold text-[rgb(var(--color-foreground))]">Microsoft Edge Neural Voices</span>
+            <InfoTip
+              align="left"
+              title="Instant Voice Comparison"
+              text={`Every voice reads "${VOICE_PREVIEW_SENTENCE}" instantly from pre-built audio so you can pick your favorite in milliseconds.`}
+            />
+          </div>
+          <span className="text-[11px] text-[rgb(var(--color-foreground-muted))]">
+            Preview: &ldquo;{VOICE_PREVIEW_SENTENCE}&rdquo;
+          </span>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          {VOICE_MODULE_PRESETS.map(preset => {
+            const active = voiceSettings.selectedPresetId === preset.id;
+            return (
+              <button
+                key={preset.id}
+                type="button"
+                onClick={() => {
+                  voiceSettings.applyPreset(preset.id);
+                  showNotice('success', `Voice module set to ${preset.label}.`);
+                  playVoiceSample();
+                }}
+                className={cn(
+                  'text-left p-3 rounded-xl border transition-all',
+                  active
+                    ? 'border-sky-400/70 bg-sky-500/10 ring-1 ring-sky-400/30'
+                    : 'border-[rgb(var(--color-border))] hover:bg-[rgb(var(--color-surface-hover))]'
+                )}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-semibold text-[rgb(var(--color-foreground))]">{preset.label}</span>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-500/15 text-emerald-400">
+                      Instant
+                    </span>
+                    {active && (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-sky-500/20 text-sky-400">
+                        Active
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <p className="text-[11px] text-[rgb(var(--color-foreground-muted))] mt-1 whitespace-normal leading-relaxed">
+                  {preset.description}
+                </p>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+
+      {/* Speed, Pitch & Speech Recognition */}
+      <section className="rounded-xl border border-[rgb(var(--color-border))] bg-[rgb(var(--color-surface))] divide-y divide-[rgb(var(--color-border))] shadow-sm">
+        <div className="px-4 py-3 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <Sliders className="w-3.5 h-3.5 text-[rgb(var(--color-foreground-muted))]" />
+            <span className="text-sm font-medium text-[rgb(var(--color-foreground))]">Voice Speed</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            {[0.75, 1, 1.25, 1.5, 2].map(rate => (
+              <button
+                key={rate}
+                type="button"
+                onClick={() => {
+                  voiceSettings.setVoiceSettings({ voiceSpeed: rate });
+                  if (testingVoice) {
+                    setLiveVoicePlaybackSpeed(rate);
+                  } else {
+                    playVoiceSample();
+                  }
+                }}
+                className={cn(
+                  'px-2.5 py-1 rounded-lg text-xs font-mono border transition-colors',
+                  voiceSettings.voiceSpeed === rate
+                    ? 'bg-[rgb(var(--color-primary))] text-[rgb(var(--color-primary-foreground))] border-transparent font-semibold'
+                    : 'border-[rgb(var(--color-border))] text-[rgb(var(--color-foreground-muted))] hover:bg-[rgb(var(--color-surface-hover))]'
+                )}
+              >
+                {rate}x
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="px-4 py-3 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <span className="text-sm font-medium text-[rgb(var(--color-foreground))]">Voice Pitch (System)</span>
+            <span className="text-xs font-mono text-[rgb(var(--color-foreground-muted))]">{voiceSettings.voicePitch.toFixed(2)}</span>
+          </div>
+          <input
+            type="range"
+            min={0.75}
+            max={1.35}
+            step={0.05}
+            value={voiceSettings.voicePitch}
+            onChange={e => voiceSettings.setVoiceSettings({ voicePitch: parseFloat(e.target.value) })}
+            className="w-44 p-0"
+          />
+        </div>
+
+        <div className="px-4 py-3 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <Mic className="w-3.5 h-3.5 text-[rgb(var(--color-foreground-muted))]" />
+            <span className="text-sm font-medium text-[rgb(var(--color-foreground))]">Speech-to-Text Module</span>
+            <InfoTip
+              align="left"
+              title="Speech Recognition Engine"
+              text="Auto uses whichever connected key supports fast transcription (Groq Whisper, OpenAI Whisper, Gemini, or offline Windows Speech)."
+            />
+          </div>
+          <select
+            value={voiceSettings.speechEngine}
+            onChange={e => voiceSettings.setVoiceSettings({ speechEngine: e.target.value as SpeechRecognitionEngine })}
+            className="w-56 text-xs bg-[rgb(var(--color-background))] border border-[rgb(var(--color-border))] rounded-lg px-2.5 py-1.5"
+          >
+            <option value="auto">Auto (All Connected Keys + Fallback)</option>
+            <option value="openai-whisper">Prefer OpenAI Whisper</option>
+            <option value="gemini">Prefer Gemini Audio</option>
+            <option value="windows-speech">Offline Windows Speech</option>
+          </select>
+        </div>
+
+        <div className="px-4 py-3 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <span className="text-sm font-medium text-[rgb(var(--color-foreground))]">Voice Conversation Language</span>
+            <InfoTip
+              align="left"
+              title="Speech Language"
+              text="Locks transcription and EXCO voice replies to English (recommended) or auto-detects spoken language."
+            />
+          </div>
+          <select
+            value={voiceSettings.speechLanguage}
+            onChange={e => voiceSettings.setVoiceSettings({ speechLanguage: e.target.value })}
+            className="w-48 text-xs bg-[rgb(var(--color-background))] border border-[rgb(var(--color-border))] rounded-lg px-2.5 py-1.5"
+          >
+            <option value="en">English (en)</option>
+            <option value="auto">Auto-detect</option>
+            <option value="hi">Hindi (hi)</option>
+            <option value="es">Spanish (es)</option>
+            <option value="fr">French (fr)</option>
+            <option value="de">German (de)</option>
+          </select>
+        </div>
+
+        <div className="px-4 py-3 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <span className="text-sm font-medium text-[rgb(var(--color-foreground))]">Mic Detection Sensitivity</span>
+          </div>
+          <select
+            value={voiceSettings.micSensitivity}
+            onChange={e => voiceSettings.setVoiceSettings({ micSensitivity: e.target.value as MicSensitivity })}
+            className="w-48 text-xs bg-[rgb(var(--color-background))] border border-[rgb(var(--color-border))] rounded-lg px-2.5 py-1.5"
+          >
+            <option value="high">High (Quiet Room)</option>
+            <option value="medium">Balanced (Default)</option>
+            <option value="low">Low (Noisy Environment)</option>
+          </select>
+        </div>
+
+        <label className="px-4 py-3 flex items-center justify-between gap-3 cursor-pointer">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <span className="text-sm font-medium text-[rgb(var(--color-foreground))]">Echo Protection (Pause Mic While EXCO Speaks)</span>
+            <InfoTip
+              align="left"
+              title="Echo Protection"
+              text="Prevents speaker audio from triggering the mic when not using headphones. Disable for hands-free interruption with headphones."
+            />
+          </div>
+          <input
+            type="checkbox"
+            checked={voiceSettings.pauseMicWhileSpeaking}
+            onChange={e => voiceSettings.setVoiceSettings({ pauseMicWhileSpeaking: e.target.checked })}
+          />
+        </label>
+      </section>
+    </div>
+  );
+
   const renderTab = () => {
     switch (activeTab) {
       case 'general':
         return renderGeneralTab();
       case 'appearance':
         return renderAppearanceTab();
+      case 'voice':
+        return renderVoiceTab();
       default:
         return renderGeneralTab();
     }

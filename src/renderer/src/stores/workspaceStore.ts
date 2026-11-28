@@ -214,7 +214,8 @@ interface WorkspaceState {
   toggleProjectExpanded: (projectId: string) => Promise<void>;
   renameProject: (projectId: string, name: string) => Promise<void>;
   deleteProject: (projectId: string) => Promise<void>;
-  setProjectConversationId: (projectId: string, conversationId: string) => Promise<void>;
+  setProjectConversationId: (projectId: string, conversationId?: string) => Promise<void>;
+  removeProjectConversationId: (projectId: string, conversationId: string) => Promise<void>;
 
   selectWorkspace: () => Promise<void>;
   removeFolderFromProject: (folderPath: string, projectId?: string) => Promise<void>;
@@ -415,11 +416,21 @@ export const useWorkspaceStore = create<WorkspaceState>()(
         );
 
         // EXCO DB cleanup ONLY — never deletes or modifies actual PC folders/files
-        if (convId) {
-          await window.exco.chat.cancelStream(convId).catch(() => {});
-          await window.exco.chat.deleteConversation(convId).catch(() => {});
-          localStorage.removeItem(`exco:work-conv:${projectId}`);
+        const convIdsToDelete = Array.from(
+          new Set([
+            ...(target.conversationId ? [target.conversationId] : []),
+            ...(Array.isArray(target.conversationIds) ? target.conversationIds : []),
+            ...(localStorage.getItem(`exco:work-conv:${projectId}`)
+              ? [localStorage.getItem(`exco:work-conv:${projectId}`)!]
+              : []),
+          ])
+        );
+        for (const cid of convIdsToDelete) {
+          await window.exco.chat.cancelStream(cid).catch(() => {});
+          await window.exco.chat.deleteConversation(cid).catch(() => {});
         }
+        localStorage.removeItem(`exco:work-conv:${projectId}`);
+        window.dispatchEvent(new CustomEvent('exco:work-conversations-updated'));
 
         const nextProjects = get().projects.filter(p => p.id !== projectId);
         const remainingPaths = new Set(getAllProjectFolderPaths(nextProjects).map(normPath));
@@ -450,10 +461,29 @@ export const useWorkspaceStore = create<WorkspaceState>()(
         await get().loadFileTree();
       },
 
-      setProjectConversationId: async (projectId: string, conversationId: string) => {
-        const nextProjects = get().projects.map(p =>
-          p.id === projectId ? { ...p, conversationId, updatedAt: Date.now() } : p
-        );
+      setProjectConversationId: async (projectId: string, conversationId?: string) => {
+        const nextProjects = get().projects.map(p => {
+          if (p.id !== projectId) return p;
+          const existingList = Array.isArray(p.conversationIds) ? p.conversationIds : [];
+          if (!conversationId) {
+            return { ...p, conversationId: undefined, updatedAt: Date.now() };
+          }
+          const nextIds = existingList.includes(conversationId)
+            ? existingList
+            : [conversationId, ...existingList.filter(Boolean)];
+          return { ...p, conversationId, conversationIds: nextIds, updatedAt: Date.now() };
+        });
+        set({ projects: nextProjects });
+        await persistProjectsToDatabase(nextProjects);
+      },
+
+      removeProjectConversationId: async (projectId: string, conversationId: string) => {
+        const nextProjects = get().projects.map(p => {
+          if (p.id !== projectId) return p;
+          const nextIds = (Array.isArray(p.conversationIds) ? p.conversationIds : []).filter(id => id !== conversationId);
+          const nextActive = p.conversationId === conversationId ? nextIds[0] : p.conversationId;
+          return { ...p, conversationId: nextActive, conversationIds: nextIds, updatedAt: Date.now() };
+        });
         set({ projects: nextProjects });
         await persistProjectsToDatabase(nextProjects);
       },

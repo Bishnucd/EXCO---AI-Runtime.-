@@ -154,21 +154,118 @@ export class OpenAIProvider extends BaseAIProvider {
   }
 
   async listModels(): Promise<AIModel[]> {
+    let base = '';
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 4500);
-      const response = await fetch(this.buildEndpoint('/v1/models'), {
-        headers: this.getHeaders(),
-        signal: controller.signal,
-      }).finally(() => clearTimeout(timeoutId));
+      base = this.resolveBaseUrl(this.config.baseUrl);
+    } catch {
+      return this.getDefaultModels();
+    }
+    if (!base) {
+      return this.getDefaultModels();
+    }
 
-      if (!response.ok) {
+    const cleanBase = base.replace(/\/+$/, '');
+    const candidateUrls: string[] = [];
+    const primaryUrl = this.buildEndpoint('/v1/models');
+    candidateUrls.push(primaryUrl);
+
+    // Some custom REST endpoints serve /models directly without /v1 prefix
+    const directModelsUrl = `${cleanBase}/models`;
+    if (!candidateUrls.includes(directModelsUrl)) {
+      candidateUrls.push(directModelsUrl);
+    }
+    // Cloudflare Workers AI account URLs may expose catalog via /ai/models/search
+    if (cleanBase.includes('api.cloudflare.com/client/v4/accounts/') && !cleanBase.includes('models/search')) {
+      const cfBase = cleanBase.replace(/\/ai\/v1$/, '/ai').replace(/\/v1$/, '');
+      candidateUrls.push(`${cfBase}/models/search`);
+    }
+
+    const extractRawList = (data: any): any[] => {
+      if (!data) return [];
+      if (Array.isArray(data)) return data;
+      if (Array.isArray(data.data)) return data.data;
+      if (Array.isArray(data.models)) return data.models;
+      if (Array.isArray(data.result)) return data.result;
+      if (Array.isArray(data.items)) return data.items;
+      if (Array.isArray(data.records)) return data.records;
+      if (Array.isArray(data.list)) return data.list;
+      if (Array.isArray(data.results)) return data.results;
+      if (data.data && typeof data.data === 'object') {
+        if (Array.isArray(data.data.models)) return data.data.models;
+        if (Array.isArray(data.data.items)) return data.data.items;
+        if (Array.isArray(data.data.list)) return data.data.list;
+      }
+      return [];
+    };
+
+    try {
+      const baseHeaders = this.getHeaders();
+      const headerVariants: Record<string, string>[] = [baseHeaders];
+      if (this.config.apiKey) {
+        headerVariants.push({
+          'Content-Type': 'application/json',
+          'x-api-key': this.config.apiKey,
+        });
+      }
+
+      let rawList: any[] = [];
+      for (const url of candidateUrls) {
+        for (let hIdx = 0; hIdx < headerVariants.length; hIdx++) {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 4500);
+          try {
+            const response = await fetch(url, {
+              headers: headerVariants[hIdx],
+              signal: controller.signal,
+            }).finally(() => clearTimeout(timeoutId));
+
+            if (response.ok) {
+              const data: any = await response.json().catch(() => null);
+              const extracted = extractRawList(data);
+              if (extracted.length > 0) {
+                rawList = extracted;
+                break;
+              }
+            } else if (response.status !== 401 && response.status !== 403) {
+              // Auth errors retry with alternate header (e.g. x-api-key); other statuses advance to next URL
+              break;
+            }
+          } catch {
+            break;
+          }
+        }
+        if (rawList.length > 0) break;
+      }
+
+      if (rawList.length === 0) {
+        const keyProfile = resolveApiKeyProfile(this.config.apiKey || '', this.provider.type, this.provider.name);
+        if (Array.isArray(this.provider.models) && this.provider.models.length > 0) {
+          return this.provider.models;
+        }
+        if (keyProfile.defaultModel && this.getType() !== 'openai') {
+          return [{
+            id: keyProfile.defaultModel,
+            name: keyProfile.defaultModel,
+            providerId: this.provider.id,
+            capabilities: { chat: true, completion: false, embedding: false, imageGeneration: false, audioTranscription: false },
+            contextWindow: 128000,
+            maxOutputTokens: 8192,
+            supportsStreaming: true,
+            supportsTools: true,
+            supportsVision: false,
+            supportsReasoning: false,
+            tier: keyProfile.tier,
+            isAvailable: true,
+          }];
+        }
         return this.getDefaultModels();
       }
 
-      const data: any = await response.json();
-      const rawList = Array.isArray(data?.data) ? data.data : Array.isArray(data?.models) ? data.models : [];
-      const accessibleList = rawList.filter(
+      const normalized = rawList
+        .map((entry: any) => (typeof entry === 'string' ? { id: entry, name: entry } : entry))
+        .filter((m: any) => m && typeof m === 'object');
+
+      const accessibleList = normalized.filter(
         (m: any) =>
           m?.available !== false &&
           m?.accessible !== false &&
@@ -178,8 +275,9 @@ export class OpenAIProvider extends BaseAIProvider {
       );
       const filtered = this.getType() === 'openai'
         ? accessibleList.filter((m: any) => {
-            if (typeof m?.id !== 'string') return false;
-            const idL = m.id.toLowerCase();
+            const idStr = String(m?.id || m?.model || m?.modelId || m?.slug || m?.name || '');
+            if (!idStr) return false;
+            const idL = idStr.toLowerCase();
             if (/(embed|whisper|tts|dall-e|moderation|transcribe|realtime|audio|search|sora|gpt-image|babbage|davinci)/.test(idL)) {
               return false;
             }
@@ -187,47 +285,50 @@ export class OpenAIProvider extends BaseAIProvider {
           })
         : accessibleList;
 
-      return filtered.map((m: any) => {
-        const modelId = m.id || m.name || String(m);
-        const contextWindow =
-          Number(m.context_window) ||
-          Number(m.context_length) ||
-          Number(m.max_model_len) ||
-          Number(m.top_provider?.context_length) ||
-          this.getContextWindow(modelId);
-        const maxOut =
-          Number(m.max_output_tokens) ||
-          Number(m.top_provider?.max_completion_tokens) ||
-          this.getMaxOutput(modelId);
-        const promptCost = Number(m.pricing?.prompt ?? 0);
-        const completionCost = Number(m.pricing?.completion ?? 0);
-        const keyProfile = resolveApiKeyProfile(this.config.apiKey || '', this.provider.type, this.provider.name);
-        const resolvedTier = inferModelTier(
-          {
-            id: modelId,
-            tier: m.tier,
-            free: m.free,
-            pricing: m.pricing ? { prompt: promptCost, completion: completionCost } : undefined,
-          },
-          keyProfile,
-          this.config.apiKey
-        );
+      return filtered
+        .map((m: any) => {
+          const modelId = String(m.id || m.model || m.modelId || m.model_id || m.slug || m.key || m.name || '').trim();
+          if (!modelId) return null;
+          const contextWindow =
+            Number(m.context_window) ||
+            Number(m.context_length) ||
+            Number(m.max_model_len) ||
+            Number(m.top_provider?.context_length) ||
+            this.getContextWindow(modelId);
+          const maxOut =
+            Number(m.max_output_tokens) ||
+            Number(m.top_provider?.max_completion_tokens) ||
+            this.getMaxOutput(modelId);
+          const promptCost = Number(m.pricing?.prompt ?? 0);
+          const completionCost = Number(m.pricing?.completion ?? 0);
+          const keyProfile = resolveApiKeyProfile(this.config.apiKey || '', this.provider.type, this.provider.name);
+          const resolvedTier = inferModelTier(
+            {
+              id: modelId,
+              tier: m.tier,
+              free: m.free,
+              pricing: m.pricing ? { prompt: promptCost, completion: completionCost } : undefined,
+            },
+            keyProfile,
+            this.config.apiKey
+          );
 
-        return {
-          id: modelId,
-          name: m.name || modelId,
-          providerId: this.provider.id,
-          capabilities: { chat: true, completion: false, embedding: false, imageGeneration: false, audioTranscription: false },
-          contextWindow,
-          maxOutputTokens: maxOut,
-          supportsStreaming: true,
-          supportsTools: this.supportsTools(modelId),
-          supportsVision: this.supportsVision(modelId),
-          supportsReasoning: false,
-          tier: resolvedTier,
-          isAvailable: typeof m.available === 'boolean' ? m.available : true,
-        };
-      });
+          return {
+            id: modelId,
+            name: String(m.name || modelId),
+            providerId: this.provider.id,
+            capabilities: { chat: true, completion: false, embedding: false, imageGeneration: false, audioTranscription: false },
+            contextWindow,
+            maxOutputTokens: maxOut,
+            supportsStreaming: true,
+            supportsTools: this.supportsTools(modelId),
+            supportsVision: this.supportsVision(modelId),
+            supportsReasoning: false,
+            tier: resolvedTier,
+            isAvailable: typeof m.available === 'boolean' ? m.available : true,
+          };
+        })
+        .filter(Boolean) as AIModel[];
     } catch {
       return this.getDefaultModels();
     }
@@ -329,7 +430,7 @@ export class OpenAIProvider extends BaseAIProvider {
   }
 
   async validateConnection(): Promise<{ success: boolean; error?: string }> {
-    if (!this.config.apiKey && this.getType() !== 'ollama') {
+    if (!this.config.apiKey && this.getType() !== 'ollama' && this.getType() !== 'custom') {
       return { success: false, error: 'No API key configured' };
     }
 
@@ -454,12 +555,18 @@ export class OpenAIProvider extends BaseAIProvider {
         buffer = lines.pop() || '';
 
         for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const jsonStr = line.slice(6);
-          if (jsonStr === '[DONE]') continue;
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const jsonStr = trimmed.slice(5).trim();
+          if (!jsonStr || jsonStr === '[DONE]') continue;
 
           try {
             const chunk: OpenAIStreamChunk = JSON.parse(jsonStr);
+            if ((chunk as any)?.error) {
+              const errMsg = (chunk as any).error?.message || JSON.stringify((chunk as any).error);
+              callbacks.onError?.(new Error(`${this.getName()} stream error: ${errMsg}`));
+              return;
+            }
             this.handleStreamChunk(chunk, callbacks, toolCalls);
           } catch {}
         }
@@ -524,7 +631,18 @@ export class OpenAIProvider extends BaseAIProvider {
     }
 
     if (stream) {
-      request.stream_options = { include_usage: true };
+      const base = (this.resolveBaseUrl(this.config.baseUrl) || '').toLowerCase();
+      const supportsStreamUsage =
+        base.includes('api.openai.com') ||
+        base.includes('groq.com') ||
+        base.includes('openrouter.ai') ||
+        base.includes('deepseek.com') ||
+        base.includes('cerebras.ai') ||
+        base.includes('together.xyz') ||
+        base.includes('fireworks.ai');
+      if (supportsStreamUsage) {
+        request.stream_options = { include_usage: true };
+      }
     }
 
     return request;
@@ -584,7 +702,7 @@ export class OpenAIProvider extends BaseAIProvider {
     callbacks: StreamCallbacks,
     toolCalls: Map<number, Partial<ToolCall>>
   ): void {
-    const choice = chunk.choices[0];
+    const choice = chunk.choices?.[0];
     if (!choice) return;
 
     const reasoningDelta = (choice.delta as any)?.reasoning_content || (choice.delta as any)?.reasoning;
@@ -635,7 +753,11 @@ export class OpenAIProvider extends BaseAIProvider {
   }
 
   private parseResponse(data: OpenAIResponse): CompletionResponse {
-    const choice = data.choices[0];
+    if ((data as any)?.error) {
+      const errMsg = (data as any).error?.message || JSON.stringify((data as any).error);
+      throw new Error(`${this.getName()} API error: ${errMsg}`);
+    }
+    const choice = data.choices?.[0];
     if (!choice) {
       return { content: '', finishReason: 'stop' };
     }
@@ -674,8 +796,16 @@ export class OpenAIProvider extends BaseAIProvider {
         }
       : undefined;
 
+    const rawMsgContent = choice.message?.content;
+    const textContent =
+      typeof rawMsgContent === 'string'
+        ? rawMsgContent
+        : Array.isArray(rawMsgContent)
+        ? (rawMsgContent as any[]).map(p => (typeof p === 'string' ? p : p?.text || '')).join('')
+        : '';
+
     return {
-      content: typeof choice.message?.content === 'string' ? choice.message.content : JSON.stringify(choice.message?.content || ''),
+      content: textContent,
       model: (data as any).model || undefined,
       toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
       usage,

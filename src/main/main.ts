@@ -49,11 +49,19 @@ function preventNavigation(window: BrowserWindow): void {
   window.webContents.on('will-navigate', (event, url) => {
     try {
       const parsedUrl = new URL(url);
-      const allowed = isDevelopment()
-        ? parsedUrl.protocol === 'http:' || parsedUrl.protocol === 'https:' || parsedUrl.protocol === 'file:'
+      const isAppOrigin = isDevelopment()
+        ? (parsedUrl.protocol === 'http:' || parsedUrl.protocol === 'https:') &&
+          (parsedUrl.hostname === 'localhost' || parsedUrl.hostname === '127.0.0.1')
         : parsedUrl.protocol === 'file:';
-      if (!allowed) {
-        event.preventDefault();
+
+      if (isAppOrigin) {
+        return;
+      }
+
+      // Open all model/user external links in the OS default browser rather than inside EXCO
+      event.preventDefault();
+      if (parsedUrl.protocol === 'https:' || parsedUrl.protocol === 'http:') {
+        shell.openExternal(url);
       }
     } catch {
       event.preventDefault();
