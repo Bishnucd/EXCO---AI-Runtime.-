@@ -54,3 +54,10 @@ jobs:
             Set-Content -Path $notesFile -Value $notes -Encoding UTF8
           }
           gh release edit $env:TAG_NAME --draft=false --title "EXCO $env:TAG_NAME" --notes-file $notesFile
+          $assets = @()
+          $assets += Get-ChildItem -Path "dist/electron" -Filter "*.exe" -File | Select-Object -ExpandProperty FullName
+          $assets += Get-ChildItem -Path "dist/electron" -Filter "*.blockmap" -File | Select-Object -ExpandProperty FullName
+          $assets += Get-ChildItem -Path "dist/electron" -Filter "latest*.yml" -File | Select-Object -ExpandProperty FullName
+          if ($assets.Count -gt 0) {
+            gh release upload $env:TAG_NAME @assets --clobber
+          }
